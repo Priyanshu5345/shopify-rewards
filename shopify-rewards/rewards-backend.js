@@ -244,6 +244,37 @@ app.post('/api/webhook/order-paid', async (req, res) => {
     res.status(500).send('error');
   }
 });
+/* POST /api/restore — called when customer removes applied points */
+app.post('/api/restore', async (req, res) => {
+  const { customer_id, points, discount_code } = req.body;
+  if (!customer_id || !points) return res.status(400).json({ error: 'Missing fields' });
 
+  try {
+    const balanceMF = await getMetafield(customer_id, 'balance');
+    const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+    const historyMF = await getMetafield(customer_id, 'history');
+    let history = [];
+    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+    // Remove the matching "use" entry from history
+    const idx = history.findIndex(
+      h => h.type === 'use' && h.points === parseInt(points, 10)
+    );
+    if (idx > -1) history.splice(idx, 1);
+
+    await Promise.all([
+      setMetafield(customer_id, 'balance', balance + parseInt(points, 10), 'integer'),
+      setMetafield(customer_id, 'history', history, 'json')
+    ]);
+
+    // Optionally delete the discount code so it can't be used
+    // (find by code title via price rules API if needed)
+
+    res.json({ ok: true, new_balance: balance + parseInt(points, 10) });
+  } catch (e) {
+    console.error('[restore POST]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rewards backend on :${PORT}`));
