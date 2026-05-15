@@ -1,0 +1,7 @@
+{
+     "name": "shopify-rewards",
+     "version": "1.0.0",
+     "main": "rewards-backend.js",
+     "dependencies": { "express": "^4.18.0" },
+     "scripts": { "start": "node rewards-backend.js" }
+  }
