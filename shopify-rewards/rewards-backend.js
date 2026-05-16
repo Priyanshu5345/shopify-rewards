@@ -402,10 +402,30 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
   if (!customerId) return res.status(200).send('ok');
 
   try {
-    // orders_count on webhook = count INCLUDING this order
-    // So first order = orders_count === 1
-    const isFirstOrder  = order.customer.orders_count === 1;
     const orderId       = order.id;
+
+    // Log raw customer data to debug first order detection
+    console.log(`[order-paid] RAW customer data:`, JSON.stringify({
+      id:           order.customer?.id,
+      orders_count: order.customer?.orders_count,
+      total_spent:  order.customer?.total_spent,
+      tags:         order.customer?.tags
+    }));
+
+    // Fetch customer directly from API for accurate orders_count
+    // (webhook payload orders_count can be stale/inaccurate)
+    let isFirstOrder = false;
+    try {
+      const custData = await shopifyFetch(`/customers/${order.customer.id}.json?fields=id,orders_count`);
+      const freshCount = custData.customer?.orders_count ?? 0;
+      isFirstOrder = freshCount <= 1; // <=1 handles both 0 and 1 edge cases
+      console.log(`[order-paid] Fresh orders_count from API: ${freshCount} | isFirstOrder: ${isFirstOrder}`);
+    } catch (e) {
+      // Fallback to webhook payload value
+      const payloadCount = order.customer?.orders_count ?? 0;
+      isFirstOrder = payloadCount <= 1;
+      console.log(`[order-paid] API fetch failed, using payload orders_count: ${payloadCount} | isFirstOrder: ${isFirstOrder}`);
+    }
 
     // First order: 50% of subtotal BEFORE discount
     // Other orders: 1% of total_price AFTER discount
