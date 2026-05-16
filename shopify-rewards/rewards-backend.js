@@ -427,14 +427,23 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
       console.log(`[order-paid] API fetch failed, using payload orders_count: ${payloadCount} | isFirstOrder: ${isFirstOrder}`);
     }
 
-    // First order: 50% of subtotal BEFORE discount
-    // Other orders: 1% of total_price AFTER discount
-    const subtotalPaise = Math.round(parseFloat(order.subtotal_price) * 100);
-    const amountPaid    = Math.round(parseFloat(order.total_price) * 100);
+    // Calculate true pre-discount total from line items
+    // (original_line_item_price * quantity, before any discounts applied)
+    const priceBeforeDiscount = (order.line_items || []).reduce((sum, item) => {
+      const originalPrice = Math.round(parseFloat(item.price) * 100); // price before line item discounts
+      return sum + (originalPrice * item.quantity);
+    }, 0);
 
+    // Amount actually paid = total_price (after all discounts including codes)
+    const amountPaid = Math.round(parseFloat(order.total_price) * 100);
+
+    console.log(`[order-paid] priceBeforeDiscount=₹${priceBeforeDiscount/100} | amountPaid=₹${amountPaid/100}`);
+
+    // First order: 50% of price BEFORE any discount
+    // Other orders: 1% of amount AFTER discount
     const earnedPoints = isFirstOrder
-      ? Math.floor(subtotalPaise / 200)   // 50% of subtotal before discount
-      : Math.floor(amountPaid / 10000);   // 1% of total after discount
+      ? Math.floor(priceBeforeDiscount / 200)   // 50% of original price
+      : Math.floor(amountPaid / 10000);          // 1% of paid amount
 
     console.log(`[order-paid] Order #${order.order_number} | subtotal=₹${subtotalPaise/100} | paid=₹${amountPaid/100} | firstOrder=${isFirstOrder} | earns=${earnedPoints}pts`);
 
