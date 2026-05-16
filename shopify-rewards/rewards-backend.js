@@ -98,6 +98,8 @@ app.get('/api/points', async (req, res) => {
     let history = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
+    // orders_count = total completed orders
+    // 0 means no orders yet → next order will be their first
     const isFirstOrder = (customerData.customer?.orders_count ?? 0) === 0;
     res.json({ balance, history: history.slice(0, 20), is_first_order: isFirstOrder });
   } catch (e) {
@@ -400,15 +402,21 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
   if (!customerId) return res.status(200).send('ok');
 
   try {
-    const amountPaid   = Math.round(parseFloat(order.total_price) * 100);
-    const isFirstOrder = order.customer.orders_count === 1;
-    const orderId      = order.id;
+    // orders_count on webhook = count INCLUDING this order
+    // So first order = orders_count === 1
+    const isFirstOrder  = order.customer.orders_count === 1;
+    const orderId       = order.id;
+
+    // First order: 50% of subtotal BEFORE discount
+    // Other orders: 1% of total_price AFTER discount
+    const subtotalPaise = Math.round(parseFloat(order.subtotal_price) * 100);
+    const amountPaid    = Math.round(parseFloat(order.total_price) * 100);
 
     const earnedPoints = isFirstOrder
-      ? Math.floor(amountPaid / 200)    // 50% of paid amount
-      : Math.floor(amountPaid / 10000); // 1% of paid amount
+      ? Math.floor(subtotalPaise / 200)   // 50% of subtotal before discount
+      : Math.floor(amountPaid / 10000);   // 1% of total after discount
 
-    console.log(`[order-paid] Order #${order.order_number} | paid=₹${amountPaid/100} | firstOrder=${isFirstOrder} | earns=${earnedPoints}pts`);
+    console.log(`[order-paid] Order #${order.order_number} | subtotal=₹${subtotalPaise/100} | paid=₹${amountPaid/100} | firstOrder=${isFirstOrder} | earns=${earnedPoints}pts`);
 
     const balanceMF = await getMetafield(customerId, 'balance');
     const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
