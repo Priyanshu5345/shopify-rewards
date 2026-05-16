@@ -211,22 +211,62 @@ app.post('/api/update-apply', async (req, res) => {
   if (newPts <= 0) return res.status(400).json({ error: 'Invalid points' });
 
   try {
-    // 1. Delete the old price rule
+    // ── 1. Check if old code was actually USED in a completed order ──
+    // Search Shopify for any order that used this discount code
+    let oldCodeWasUsed = false;
     try {
-      await deleteRwrdCode(old_discount_code);
+      const searchData = await shopifyFetch(
+        `/discount_codes/lookup.json?code=${encodeURIComponent(old_discount_code)}`
+      );
+      const priceRuleId = searchData.discount_code?.price_rule_id;
+      if (priceRuleId) {
+        // Get usage count from the discount code itself
+        const codeData = await shopifyFetch(
+          `/price_rules/${priceRuleId}/discount_codes.json`
+        );
+        const codeObj = (codeData.discount_codes || []).find(
+          c => c.code === old_discount_code
+        );
+        oldCodeWasUsed = codeObj ? codeObj.usage_count > 0 : false;
+        console.log(`[update-apply] Old code ${old_discount_code} usage_count=${codeObj?.usage_count}`);
+      }
     } catch (e) {
-      console.error('[update-apply] Could not delete old code:', e.message);
+      // Code not found — likely already deleted or expired
+      console.log(`[update-apply] Old code lookup failed (probably already deleted): ${e.message}`);
     }
 
-    // 2. Adjust balance for the difference
+    // ── 2. Load balance and history ──
     const balanceMF = await getMetafield(customer_id, 'balance');
     let balance = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+    const historyMF = await getMetafield(customer_id, 'history');
+    let history = [];
+    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    // Restore old points first, then deduct new amount
-    balance = balance + oldPts - newPts;
+    if (!oldCodeWasUsed) {
+      // ── Old code was NOT used — safe to delete and fully refund old points ──
+      try { await deleteRwrdCode(old_discount_code); } catch {}
+
+      // Restore old points fully (as if they were never deducted)
+      balance = balance + oldPts;
+
+      // Remove old use entry from history completely — no trace
+      history = history.filter(
+        h => !(h.type === 'use' && h.discount_code === old_discount_code)
+      );
+
+      console.log(`[update-apply] Old code unused — deleted cleanly. Balance restored to ${balance}`);
+
+    } else {
+      // ── Old code WAS used — cannot delete or restore those points ──
+      // Just proceed with fresh deduction for new amount
+      console.log(`[update-apply] Old code was used in an order — cannot restore those ${oldPts} pts`);
+    }
+
+    // ── 3. Deduct new points ──
+    balance = balance - newPts;
     if (balance < 0) return res.status(400).json({ error: 'Insufficient points' });
 
-    // 3. Create new price rule + code
+    // ── 4. Create new price rule + code ──
     const code = `RWRD-${customer_id}-${Date.now()}`;
     const discountData = await shopifyFetch('/price_rules.json', {
       method: 'POST',
@@ -253,15 +293,7 @@ app.post('/api/update-apply', async (req, res) => {
       body: JSON.stringify({ discount_code: { code } })
     });
 
-    // 4. Update history — replace old use entry with new one
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
-
-    // Remove old use entry for this code
-    history = history.filter(h => !(h.type === 'use' && h.discount_code === old_discount_code));
-
-    // Add new use entry
+    // ── 5. Add new use entry to history ──
     history.unshift({
       type:          'use',
       description:   `${newPts} points redeemed`,
@@ -275,8 +307,9 @@ app.post('/api/update-apply', async (req, res) => {
       setMetafield(customer_id, 'history', history, 'json')
     ]);
 
-    console.log(`[update-apply] Updated: ${oldPts}pts → ${newPts}pts. New balance: ${balance}`);
+    console.log(`[update-apply] Done. Old=${oldPts}pts used=${oldCodeWasUsed} → New=${newPts}pts. Balance=${balance}`);
     res.json({ discount_code: code, discount_amount: newPts });
+
   } catch (e) {
     console.error('[update-apply]', e.message);
     res.status(500).json({ error: e.message });
@@ -288,25 +321,62 @@ app.post('/api/update-apply', async (req, res) => {
    Called when customer removes applied points from cart
    ───────────────────────────────────────── */
 app.post('/api/restore', async (req, res) => {
-  const { customer_id, points } = req.body;
+  const { customer_id, points, discount_code } = req.body;
   if (!customer_id || !points) return res.status(400).json({ error: 'Missing fields' });
 
+  const pts = parseInt(points, 10);
+
   try {
+    // ── Check if discount code was actually used before restoring ──
+    let codeWasUsed = false;
+    if (discount_code) {
+      try {
+        const searchData = await shopifyFetch(
+          `/discount_codes/lookup.json?code=${encodeURIComponent(discount_code)}`
+        );
+        const priceRuleId = searchData.discount_code?.price_rule_id;
+        if (priceRuleId) {
+          const codeData = await shopifyFetch(
+            `/price_rules/${priceRuleId}/discount_codes.json`
+          );
+          const codeObj = (codeData.discount_codes || []).find(c => c.code === discount_code);
+          codeWasUsed = codeObj ? codeObj.usage_count > 0 : false;
+
+          // Delete the price rule if unused
+          if (!codeWasUsed) {
+            await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
+            console.log(`[restore] Deleted unused price rule ${priceRuleId}`);
+          }
+        }
+      } catch (e) {
+        console.log(`[restore] Code lookup failed (may already be deleted): ${e.message}`);
+      }
+    }
+
     const balanceMF = await getMetafield(customer_id, 'balance');
     const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
     const historyMF = await getMetafield(customer_id, 'history');
     let history = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    const idx = history.findIndex(h => h.type === 'use' && h.points === parseInt(points, 10) && !h.refunded);
-    if (idx > -1) history.splice(idx, 1);
+    if (!codeWasUsed) {
+      // Code never used — remove the history entry completely (no trace)
+      history = history.filter(
+        h => !(h.type === 'use' && h.discount_code === discount_code)
+      );
+      // Restore points fully
+      await Promise.all([
+        setMetafield(customer_id, 'balance', balance + pts, 'integer'),
+        setMetafield(customer_id, 'history', history, 'json')
+      ]);
+      console.log(`[restore] Unused code removed cleanly. ${pts} pts restored.`);
+    } else {
+      // Code was used in a completed order — don't restore points
+      // The order-paid webhook handles points earning separately
+      console.log(`[restore] Code was used in order — points not restored.`);
+    }
 
-    await Promise.all([
-      setMetafield(customer_id, 'balance', balance + parseInt(points, 10), 'integer'),
-      setMetafield(customer_id, 'history', history, 'json')
-    ]);
-
-    res.json({ ok: true });
+    res.json({ ok: true, restored: !codeWasUsed });
   } catch (e) {
     console.error('[restore POST]', e.message);
     res.status(500).json({ error: e.message });
