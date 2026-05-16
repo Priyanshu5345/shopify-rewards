@@ -511,5 +511,21 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
   }
 });
 
+// Keep Railway container alive by self-pinging every 4 minutes
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/api/points?customer_id=ping`
+  : null;
+
+if (SELF_URL) {
+  setInterval(async () => {
+    try {
+      await fetch(SELF_URL);
+      console.log('[keepalive] ping sent');
+    } catch (e) {
+      console.error('[keepalive] ping failed:', e.message);
+    }
+  }, 4 * 60 * 1000); // every 4 minutes
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rewards backend on :${PORT}`));
