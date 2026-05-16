@@ -23,7 +23,11 @@ const express = require('express');
 const crypto  = require('crypto');
 const app     = express();
 
-app.use(express.json());
+// Parse JSON for all routes EXCEPT the webhook (which needs raw bytes for HMAC)
+app.use((req, res, next) => {
+  if (req.path === '/api/webhook/order-paid') return next();
+  express.json()(req, res, next);
+});
 
 const SHOP   = process.env.SHOPIFY_SHOP;
 const TOKEN  = process.env.SHOPIFY_ACCESS_TOKEN;
@@ -190,53 +194,79 @@ app.post('/api/apply', async (req, res) => {
    Called by Shopify order-paid webhook.
    Awards points on completed purchase.
    ───────────────────────────────────────── */
-app.post('/api/webhook/order-paid', async (req, res) => {
-  // Verify HMAC
-  const hmac = req.headers['x-shopify-hmac-sha256'];
-  const body  = JSON.stringify(req.body);
-  const hash  = crypto.createHmac('sha256', SECRET).update(body).digest('base64');
-  if (hash !== hmac) return res.status(401).send('Unauthorized');
+/* ── Webhook needs raw body for HMAC — add rawBody middleware before routes ── */
+app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), async (req, res) => {
+  // Verify HMAC using RAW body bytes (not re-serialized JSON)
+  app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), async (req, res) => {
+  // Verify HMAC using RAW body bytes (not re-serialized JSON)
+  const hmac    = req.headers['x-shopify-hmac-sha256'];
+  const rawBody = req.body; // Buffer, because of express.raw()
+  const hash    = crypto.createHmac('sha256', SECRET).update(rawBody).digest('base64');
 
-  const order      = req.body;
+  console.log('[webhook] received hmac:', hmac);
+  console.log('[webhook] computed hash:', hash);
+  console.log('[webhook] secret used:', SECRET ? SECRET.slice(0,6) + '...' : 'MISSING');
+
+  if (hash !== hmac) {
+    console.error('[webhook] HMAC mismatch — check SHOPIFY_API_SECRET');
+    return res.status(401).send('Unauthorized');
+  }
+
+  let order;
+  try {
+    order = JSON.parse(rawBody.toString('utf8'));
+  } catch (e) {
+    return res.status(400).send('Bad JSON');
+  }
+
   const customerId = order.customer?.id;
   if (!customerId) return res.status(200).send('ok');
 
   try {
-    const orderTotal     = Math.round(parseFloat(order.total_price) * 100); // in paise
-    const discountAmount = Math.round(parseFloat(order.total_discounts || 0) * 100);
+    // Use total_price as what customer actually paid (already has discount applied)
+    const amountPaid     = Math.round(parseFloat(order.total_price) * 100);   // paise
+    const discountAmount = Math.round(parseFloat(order.total_discounts || 0) * 100); // paise
     const isFirstOrder   = order.customer.orders_count === 1;
     const orderId        = order.id;
 
+    console.log(`[webhook] Order #${order.order_number} | paid=₹${amountPaid/100} | discount=₹${discountAmount/100} | firstOrder=${isFirstOrder}`);
+
     // Points earning rule
+    // First order: 50% of amount paid
+    // Other orders: 1% of amount paid (discount already reflected in total_price)
     let earnedPoints;
     if (isFirstOrder) {
-      earnedPoints = Math.floor(orderTotal / 200);          // 50% of order total (₹)
+      earnedPoints = Math.floor(amountPaid / 200);   // 50% → paise/200 = rupees*0.5
     } else {
-      const payable = Math.max(0, orderTotal - discountAmount);
-      earnedPoints  = Math.floor(payable / 10000);           // 1% of payable (₹)
+      earnedPoints = Math.floor(amountPaid / 10000); // 1%  → paise/10000 = rupees*0.01
     }
+    earnedPoints = Math.max(0, earnedPoints); // never negative
 
-    if (earnedPoints > 0) {
-      const balanceMF = await getMetafield(customerId, 'balance');
-      const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-      const historyMF = await getMetafield(customerId, 'history');
-      let history = [];
-      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+    console.log(`[webhook] Customer ${customerId} earns ${earnedPoints} pts`);
 
-      history.unshift({
-        type:        'earn',
-        description: `Order #${order.order_number} — ${earnedPoints} points earned`,
-        points:      earnedPoints,
-        created_at:  new Date().toISOString()
-      });
+    // Always update — even if earnedPoints is 0, we log it
+    const balanceMF = await getMetafield(customerId, 'balance');
+    const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+    const historyMF = await getMetafield(customerId, 'history');
+    let history = [];
+    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-      await Promise.all([
-        setMetafield(customerId, 'balance', balance + earnedPoints, 'integer'),
-        setMetafield(customerId, 'history', history, 'json')
-      ]);
+    const newBalance = balance + earnedPoints;
 
-      console.log(`[webhook] Customer ${customerId} earned ${earnedPoints} pts on order ${orderId}`);
-    }
+    history.unshift({
+      type:        'earn',
+      description: `Order #${order.order_number} — ${earnedPoints} pts earned`,
+      points:      earnedPoints,
+      created_at:  new Date().toISOString(),
+      order_id:    orderId
+    });
+
+    await Promise.all([
+      setMetafield(customerId, 'balance', newBalance, 'integer'),
+      setMetafield(customerId, 'history', history, 'json')
+    ]);
+
+    console.log(`[webhook] Balance updated: ${balance} + ${earnedPoints} = ${newBalance}`);
 
     res.status(200).send('ok');
   } catch (e) {
@@ -244,37 +274,6 @@ app.post('/api/webhook/order-paid', async (req, res) => {
     res.status(500).send('error');
   }
 });
-/* POST /api/restore — called when customer removes applied points */
-app.post('/api/restore', async (req, res) => {
-  const { customer_id, points, discount_code } = req.body;
-  if (!customer_id || !points) return res.status(400).json({ error: 'Missing fields' });
 
-  try {
-    const balanceMF = await getMetafield(customer_id, 'balance');
-    const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
-
-    // Remove the matching "use" entry from history
-    const idx = history.findIndex(
-      h => h.type === 'use' && h.points === parseInt(points, 10)
-    );
-    if (idx > -1) history.splice(idx, 1);
-
-    await Promise.all([
-      setMetafield(customer_id, 'balance', balance + parseInt(points, 10), 'integer'),
-      setMetafield(customer_id, 'history', history, 'json')
-    ]);
-
-    // Optionally delete the discount code so it can't be used
-    // (find by code title via price rules API if needed)
-
-    res.json({ ok: true, new_balance: balance + parseInt(points, 10) });
-  } catch (e) {
-    console.error('[restore POST]', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rewards backend on :${PORT}`));
