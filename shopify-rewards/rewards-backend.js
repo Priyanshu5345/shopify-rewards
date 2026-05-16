@@ -250,12 +250,50 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
     ]);
 
     console.log(`[order-paid] Balance: ${balance} + ${earnedPoints} = ${newBalance}`);
+
+    // ── Clean up used RWRD- discount codes so they don't clutter Shopify Discounts ──
+    const usedCodes = (order.discount_codes || [])
+      .filter(d => d.code && d.code.startsWith('RWRD-'));
+
+    for (const d of usedCodes) {
+      try {
+        // Find price rule by searching discount codes
+        const searchData = await shopifyFetch(
+          `/discount_codes/lookup.json?code=${encodeURIComponent(d.code)}`
+        );
+        const priceRuleId = searchData.discount_code?.price_rule_id;
+        if (priceRuleId) {
+          await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
+          console.log(`[order-paid] Deleted price rule ${priceRuleId} for code ${d.code}`);
+        }
+      } catch (err) {
+        // Non-fatal — log and continue
+        console.error(`[order-paid] Could not delete discount code ${d.code}:`, err.message);
+      }
+    }
+
     res.status(200).send('ok');
   } catch (e) {
     console.error('[order-paid]', e.message);
     res.status(500).send('error');
   }
 });
+
+/* ── Helper: delete a RWRD- price rule by code ── */
+async function deleteRwrdCode(code) {
+  try {
+    const searchData = await shopifyFetch(
+      `/discount_codes/lookup.json?code=${encodeURIComponent(code)}`
+    );
+    const priceRuleId = searchData.discount_code?.price_rule_id;
+    if (priceRuleId) {
+      await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
+      console.log(`[cleanup] Deleted price rule ${priceRuleId} for ${code}`);
+    }
+  } catch (e) {
+    console.error(`[cleanup] Could not delete ${code}:`, e.message);
+  }
+}
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-cancelled
@@ -350,6 +388,11 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
     ]);
 
     console.log(`[order-cancelled] Done. New balance: ${balance}`);
+
+    // Delete any unused RWRD- codes (order cancelled before use, or used ones already cleaned by order-paid)
+    const codesToDelete = (order.discount_codes || []).filter(d => d.code && d.code.startsWith('RWRD-'));
+    for (const d of codesToDelete) await deleteRwrdCode(d.code);
+
     res.status(200).send('ok');
   } catch (e) {
     console.error('[order-cancelled]', e.message);
