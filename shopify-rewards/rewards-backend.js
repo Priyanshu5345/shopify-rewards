@@ -123,6 +123,28 @@ app.post('/api/apply', async (req, res) => {
     const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
     if (ptsInt > balance) return res.status(400).json({ error: 'Insufficient points' });
 
+    // ── Check if an unused RWRD code already exists for this customer + amount ──
+    // This prevents duplicate codes if customer goes back and clicks Apply again.
+    const historyMF = await getMetafield(customer_id, 'history');
+    let history = [];
+    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+    const existingUse = history.find(
+      h => h.type === 'use'
+        && h.points === ptsInt
+        && !h.refunded
+        && h.discount_code
+        && h.discount_code.startsWith('RWRD-')
+        // Only reuse if created within the last 30 minutes
+        && (Date.now() - new Date(h.created_at).getTime()) < 30 * 60 * 1000
+    );
+
+    if (existingUse) {
+      // Return the existing code — no new code, no balance deduction
+      console.log(`[apply] Reusing existing code ${existingUse.discount_code} for customer ${customer_id}`);
+      return res.json({ discount_code: existingUse.discount_code, discount_amount: ptsInt });
+    }
+
     const code = `RWRD-${customer_id}-${Date.now()}`;
     const discountData = await shopifyFetch('/price_rules.json', {
       method: 'POST',
@@ -154,10 +176,11 @@ app.post('/api/apply', async (req, res) => {
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
     history.unshift({
-      type:        'use',
-      description: `${ptsInt} points redeemed`,
-      points:      ptsInt,
-      created_at:  new Date().toISOString()
+      type:          'use',
+      description:   `${ptsInt} points redeemed`,
+      points:        ptsInt,
+      discount_code: code,   // stored so we can reuse if customer comes back
+      created_at:    new Date().toISOString()
     });
 
     await Promise.all([
@@ -168,6 +191,97 @@ app.post('/api/apply', async (req, res) => {
     res.json({ discount_code: code, discount_amount: ptsInt });
   } catch (e) {
     console.error('[apply POST]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ─────────────────────────────────────────
+   ROUTE: POST /api/update-apply
+   Called when customer changes points amount after already applying.
+   - Deletes old price rule
+   - Adjusts balance for the difference
+   - Creates new price rule + code
+   Body: { customer_id, old_points, old_discount_code, new_points, cart_total }
+   ───────────────────────────────────────── */
+app.post('/api/update-apply', async (req, res) => {
+  const { customer_id, old_points, old_discount_code, new_points, cart_total } = req.body;
+  if (!customer_id || !new_points || !old_discount_code) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+
+  const oldPts = parseInt(old_points, 10);
+  const newPts = parseInt(new_points, 10);
+  if (newPts <= 0) return res.status(400).json({ error: 'Invalid points' });
+
+  try {
+    // 1. Delete the old price rule
+    try {
+      await deleteRwrdCode(old_discount_code);
+    } catch (e) {
+      console.error('[update-apply] Could not delete old code:', e.message);
+    }
+
+    // 2. Adjust balance for the difference
+    const balanceMF = await getMetafield(customer_id, 'balance');
+    let balance = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+
+    // Restore old points first, then deduct new amount
+    balance = balance + oldPts - newPts;
+    if (balance < 0) return res.status(400).json({ error: 'Insufficient points' });
+
+    // 3. Create new price rule + code
+    const code = `RWRD-${customer_id}-${Date.now()}`;
+    const discountData = await shopifyFetch('/price_rules.json', {
+      method: 'POST',
+      body: JSON.stringify({
+        price_rule: {
+          title:                     `Rewards redemption ${code}`,
+          target_type:               'line_item',
+          target_selection:          'all',
+          allocation_method:         'across',
+          value_type:                'fixed_amount',
+          value:                     `-${newPts}.00`,
+          customer_selection:        'prerequisite',
+          prerequisite_customer_ids: [parseInt(customer_id)],
+          usage_limit:               1,
+          once_per_customer:         true,
+          starts_at:                 new Date().toISOString()
+        }
+      })
+    });
+
+    const priceRuleId = discountData.price_rule.id;
+    await shopifyFetch(`/price_rules/${priceRuleId}/discount_codes.json`, {
+      method: 'POST',
+      body: JSON.stringify({ discount_code: { code } })
+    });
+
+    // 4. Update history — replace old use entry with new one
+    const historyMF = await getMetafield(customer_id, 'history');
+    let history = [];
+    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+    // Remove old use entry for this code
+    history = history.filter(h => !(h.type === 'use' && h.discount_code === old_discount_code));
+
+    // Add new use entry
+    history.unshift({
+      type:          'use',
+      description:   `${newPts} points redeemed`,
+      points:        newPts,
+      discount_code: code,
+      created_at:    new Date().toISOString()
+    });
+
+    await Promise.all([
+      setMetafield(customer_id, 'balance', balance, 'integer'),
+      setMetafield(customer_id, 'history', history, 'json')
+    ]);
+
+    console.log(`[update-apply] Updated: ${oldPts}pts → ${newPts}pts. New balance: ${balance}`);
+    res.json({ discount_code: code, discount_amount: newPts });
+  } catch (e) {
+    console.error('[update-apply]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
