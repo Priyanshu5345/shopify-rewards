@@ -486,13 +486,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Rewards backend on :${PORT}`);
 
-  // Self-ping every 4 minutes to prevent Railway free tier sleeping
-  const domain = process.env.RAILWAY_PUBLIC_DOMAIN;
-  if (domain) {
-    const pingUrl = `https://${domain}/api/points?customer_id=keepalive`;
-    setInterval(async () => {
-      try { await fetch(pingUrl); console.log('[keepalive] ping ok'); }
-      catch (e) { console.error('[keepalive] ping failed:', e.message); }
-    }, 4 * 60 * 1000);
-  }
+
 });
