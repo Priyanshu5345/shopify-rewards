@@ -117,8 +117,17 @@ app.post('/api/apply', async (req, res) => {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
-  const ptsInt = parseInt(points_to_use, 10);
+  const ptsInt    = parseInt(points_to_use, 10);
+  const cartPaise = parseInt(cart_total, 10) || 0;
   if (ptsInt <= 0) return res.status(400).json({ error: 'Invalid points' });
+
+  // Max discount = 50% of cart total
+  const maxAllowedPts = Math.floor(cartPaise / 200); // 50% of cart in rupees
+  if (ptsInt > maxAllowedPts) {
+    return res.status(400).json({
+      error: `Max points allowed is ${maxAllowedPts} (50% of cart value)`
+    });
+  }
 
   try {
     const balanceMF = await getMetafield(customer_id, 'balance');
@@ -208,9 +217,18 @@ app.post('/api/update-apply', async (req, res) => {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
-  const oldPts = parseInt(old_points, 10);
-  const newPts = parseInt(new_points, 10);
+  const oldPts    = parseInt(old_points, 10);
+  const newPts    = parseInt(new_points, 10);
+  const cartPaise = parseInt(cart_total, 10) || 0;
   if (newPts <= 0) return res.status(400).json({ error: 'Invalid points' });
+
+  // Max discount = 50% of cart total
+  const maxAllowedPts = Math.floor(cartPaise / 200);
+  if (newPts > maxAllowedPts) {
+    return res.status(400).json({
+      error: `Max points allowed is ${maxAllowedPts} (50% of cart value)`
+    });
+  }
 
   try {
     // ── 1. Check if old code was actually USED in a completed order ──
