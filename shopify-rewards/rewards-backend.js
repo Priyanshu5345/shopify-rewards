@@ -171,15 +171,12 @@ app.post('/api/apply', async (req, res) => {
       body: JSON.stringify({ discount_code: { code } })
     });
 
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
-
+    // history already fetched above — reuse it
     history.unshift({
       type:          'use',
       description:   `${ptsInt} points redeemed`,
       points:        ptsInt,
-      discount_code: code,   // stored so we can reuse if customer comes back
+      discount_code: code,
       created_at:    new Date().toISOString()
     });
 
