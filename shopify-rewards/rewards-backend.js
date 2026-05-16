@@ -445,7 +445,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
       ? Math.floor(priceBeforeDiscount / 200)   // 50% of original price
       : Math.floor(amountPaid / 10000);          // 1% of paid amount
 
-    console.log(`[order-paid] Order #${order.order_number} | subtotal=₹${subtotalPaise/100} | paid=₹${amountPaid/100} | firstOrder=${isFirstOrder} | earns=${earnedPoints}pts`);
+    console.log(`[order-paid] Order #${order.order_number} | priceBeforeDiscount=₹${priceBeforeDiscount/100} | paid=₹${amountPaid/100} | firstOrder=${isFirstOrder} | earns=${earnedPoints}pts`);
 
     const balanceMF = await getMetafield(customerId, 'balance');
     const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
