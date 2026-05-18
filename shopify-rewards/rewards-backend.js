@@ -109,6 +109,39 @@ app.get('/api/points', async (req, res) => {
 });
 
 /* ─────────────────────────────────────────
+   ROUTE: GET /api/check-code?code=RWRD-xxx
+   Checks if a discount code still exists and hasn't been used.
+   Returns { valid: bool, usage_count: int }
+   ───────────────────────────────────────── */
+app.get('/api/check-code', async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).json({ valid: false, error: 'Missing code' });
+
+  try {
+    const data = await shopifyFetch(
+      `/discount_codes/lookup.json?code=${encodeURIComponent(code)}`
+    );
+    const dc = data.discount_code;
+    if (!dc) return res.json({ valid: false, usage_count: 0 });
+
+    // Get full details including usage_count
+    const priceRuleId = dc.price_rule_id;
+    const codeData    = await shopifyFetch(
+      `/price_rules/${priceRuleId}/discount_codes.json`
+    );
+    const codeObj = (codeData.discount_codes || []).find(c => c.code === code);
+
+    res.json({
+      valid:       !!codeObj,
+      usage_count: codeObj?.usage_count ?? 0
+    });
+  } catch (e) {
+    // Code not found = deleted/used
+    res.json({ valid: false, usage_count: 0 });
+  }
+});
+
+/* ─────────────────────────────────────────
    ROUTE: POST /api/apply
    ───────────────────────────────────────── */
 app.post('/api/apply', async (req, res) => {
