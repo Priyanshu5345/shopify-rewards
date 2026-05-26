@@ -31,7 +31,13 @@ async function shopifyFetch(path, options = {}) {
     const text = await res.text();
     throw new Error(`Shopify API error ${res.status}: ${text}`);
   }
-  return res.json();
+  // 204 No Content (e.g. DELETE) returns empty body — don't parse as JSON
+  if (res.status === 204 || res.headers.get('content-length') === '0') {
+    return {};
+  }
+  const text = await res.text();
+  if (!text) return {};
+  return JSON.parse(text);
 }
 
 /* ── GET metafield ── */
@@ -98,10 +104,9 @@ app.get('/api/points', async (req, res) => {
     let history = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    // orders_count = total completed orders
-    // 0 means no orders yet → next order will be their first
-    const isFirstOrder = (customerData.customer?.orders_count ?? 0) === 0;
-    res.json({ balance, history: history.slice(0, 20), is_first_order: isFirstOrder });
+    // 50% bonus now triggered by FIRST50 coupon — is_first_order always false
+
+    res.json({ balance, history: history.slice(0, 20), is_first_order: false });
   } catch (e) {
     console.error('[points GET]', e.message);
     res.status(500).json({ error: e.message });
@@ -455,48 +460,24 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
   try {
     const orderId       = order.id;
 
-    // Log raw customer data to debug first order detection
-    console.log(`[order-paid] RAW customer data:`, JSON.stringify({
-      id:           order.customer?.id,
-      orders_count: order.customer?.orders_count,
-      total_spent:  order.customer?.total_spent,
-      tags:         order.customer?.tags
-    }));
+    // ── Check if FIRST50 coupon was used ──
+    // This coupon triggers 50% points on total excluding discount
+    const BONUS_COUPON     = 'FIRST50'; // change this anytime
+    const usedCouponCodes  = (order.discount_codes || []).map(d => (d.code || '').toUpperCase());
+    const usedBonusCoupon  = usedCouponCodes.includes(BONUS_COUPON.toUpperCase());
 
-    // Fetch customer directly from API for accurate orders_count
-    // (webhook payload orders_count can be stale/inaccurate)
-    let isFirstOrder = false;
-    try {
-      const custData = await shopifyFetch(`/customers/${order.customer.id}.json?fields=id,orders_count`);
-      const freshCount = custData.customer?.orders_count ?? 0;
-      isFirstOrder = freshCount <= 1; // <=1 handles both 0 and 1 edge cases
-      console.log(`[order-paid] Fresh orders_count from API: ${freshCount} | isFirstOrder: ${isFirstOrder}`);
-    } catch (e) {
-      // Fallback to webhook payload value
-      const payloadCount = order.customer?.orders_count ?? 0;
-      isFirstOrder = payloadCount <= 1;
-      console.log(`[order-paid] API fetch failed, using payload orders_count: ${payloadCount} | isFirstOrder: ${isFirstOrder}`);
-    }
-
-    // Calculate true pre-discount total from line items
-    // (original_line_item_price * quantity, before any discounts applied)
-    const priceBeforeDiscount = (order.line_items || []).reduce((sum, item) => {
-      const originalPrice = Math.round(parseFloat(item.price) * 100); // price before line item discounts
-      return sum + (originalPrice * item.quantity);
-    }, 0);
-
-    // Amount actually paid = total_price (after all discounts including codes)
+    // Amount actually paid = total_price (after all discounts)
     const amountPaid = Math.round(parseFloat(order.total_price) * 100);
 
-    console.log(`[order-paid] priceBeforeDiscount=₹${priceBeforeDiscount/100} | amountPaid=₹${amountPaid/100}`);
+    // For bonus coupon: 50% of amount paid (after discount — so FIRST50 discount already excluded)
+    // For all other orders: 1% of amount paid
+    const earnedPoints = usedBonusCoupon
+      ? Math.floor(amountPaid / 200)   // 50% of total after discount
+      : Math.floor(amountPaid / 10000); // 1% of total after discount
 
-    // First order: 50% of price BEFORE any discount
-    // Other orders: 1% of amount AFTER discount
-    const earnedPoints = isFirstOrder
-      ? Math.floor(priceBeforeDiscount / 200)   // 50% of original price
-      : Math.floor(amountPaid / 10000);          // 1% of paid amount
+    console.log(`[order-paid] amountPaid=₹${amountPaid/100} | usedBonusCoupon=${usedBonusCoupon} | earns=${earnedPoints}pts | coupons=${usedCouponCodes.join(',')}`);
 
-    console.log(`[order-paid] Order #${order.order_number} | priceBeforeDiscount=₹${priceBeforeDiscount/100} | paid=₹${amountPaid/100} | firstOrder=${isFirstOrder} | earns=${earnedPoints}pts`);
+    console.log(`[order-paid] Order #${order.order_number} | priceBeforeDiscount=₹${priceBeforeDiscount/100} | paid=₹${amountPaid/100} | earns=${earnedPoints}pts`);
 
     const balanceMF = await getMetafield(customerId, 'balance');
     const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
