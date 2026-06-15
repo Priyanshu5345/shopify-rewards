@@ -477,7 +477,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
     console.log(`[order-paid] amountPaid=₹${amountPaid/100} | usedBonusCoupon=${usedBonusCoupon} | earns=${earnedPoints}pts | coupons=${usedCouponCodes.join(',')}`);
 
-    console.log(`[order-paid] Order #${order.order_number} | priceBeforeDiscount=₹${priceBeforeDiscount/100} | paid=₹${amountPaid/100} | earns=${earnedPoints}pts`);
+    console.log(`[order-paid] Order #${order.order_number} | paid=₹${amountPaid/100} | earns=${earnedPoints}pts`);
 
     const balanceMF = await getMetafield(customerId, 'balance');
     const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
