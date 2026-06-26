@@ -501,7 +501,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
     // Points calculation
     const earnedPoints = usedBonusCoupon
-      ? Math.floor(amountPaid / 200)    // 50% of amount paid
+      ? Math.floor(amountPaid / 100)    // 50% of amount paid
       : Math.floor(amountPaid / 10000); // 1% of amount paid
 
     console.log(`[order-paid] Order #${order.order_number} | paid=₹${amountPaid/100} | bonus=${usedBonusCoupon} | earns=${earnedPoints}pts`);
