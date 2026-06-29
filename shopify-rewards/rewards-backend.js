@@ -39,7 +39,7 @@ const HEADERS = {
    ───────────────────────────────────────── */
 
 async function shopifyFetch(path, options = {}) {
-  const res = await fetch(`https://${SHOP}/admin/api/2024-04${path}`, {
+  const res = await fetch(`https://${SHOP}/admin/api/2026-04${path}`, {
     ...options,
     headers: { ...HEADERS, ...options.headers }
   });
@@ -471,6 +471,60 @@ app.post('/api/restore', async (req, res) => {
 });
 
 /* ─────────────────────────────────────────
+   WEBHOOK: POST /api/webhook/customer-created
+   Awards 100 welcome points to new customers on registration.
+   Only credits once — checked via existing balance metafield presence.
+   ───────────────────────────────────────── */
+const WELCOME_POINTS = 100;
+
+app.post('/api/webhook/customer-created', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!verifyHmac(req)) {
+    console.error('[webhook/customer-created] HMAC mismatch');
+    return res.status(401).send('Unauthorized');
+  }
+
+  let customer;
+  try { customer = parseWebhookBody(req); }
+  catch (e) { return res.status(400).send('Bad JSON'); }
+
+  const customerId = customer.id;
+  if (!customerId) return res.status(200).send('ok');
+
+  try {
+    // Check if balance metafield already exists — prevents double crediting
+    const existing = await getMetafield(customerId, 'balance');
+    if (existing) {
+      console.log(`[customer-created] Customer ${customerId} already has points — skipping welcome bonus`);
+      return res.status(200).send('ok');
+    }
+
+    const expiresAt = new Date();
+    expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
+
+    const history = [{
+      type:             'earn',
+      description:      'Welcome bonus',
+      points:           WELCOME_POINTS,
+      remaining_points: WELCOME_POINTS,
+      created_at:       new Date().toISOString(),
+      expires_at:       expiresAt.toISOString(),
+      is_welcome:       true
+    }];
+
+    await Promise.all([
+      setMetafield(customerId, 'balance', WELCOME_POINTS, 'integer'),
+      setMetafield(customerId, 'history', history, 'json')
+    ]);
+
+    console.log(`[customer-created] Customer ${customerId} (${customer.email}) — ${WELCOME_POINTS} welcome pts credited`);
+    res.status(200).send('ok');
+  } catch (e) {
+    console.error('[customer-created]', e.message);
+    res.status(500).send('error');
+  }
+});
+
+/* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-paid
    Awards points after a completed purchase.
    Bonus coupon FREE50 → 50% of amount paid.
@@ -501,7 +555,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
     // Points calculation
     const earnedPoints = usedBonusCoupon
-      ? Math.floor(amountPaid / 100)    // 50% of amount paid
+      ? Math.floor(amountPaid / 100)    // 100% of amount paid
       : Math.floor(amountPaid / 10000); // 1% of amount paid
 
     console.log(`[order-paid] Order #${order.order_number} | paid=₹${amountPaid/100} | bonus=${usedBonusCoupon} | earns=${earnedPoints}pts`);
