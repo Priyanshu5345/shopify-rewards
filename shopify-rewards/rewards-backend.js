@@ -39,7 +39,7 @@ const HEADERS = {
    ───────────────────────────────────────── */
 
 async function shopifyFetch(path, options = {}) {
-  const res = await fetch(`https://${SHOP}/admin/api/2026-04${path}`, {
+  const res = await fetch(`https://${SHOP}/admin/api/2025-04${path}`, {
     ...options,
     headers: { ...HEADERS, ...options.headers }
   });
