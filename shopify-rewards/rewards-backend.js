@@ -65,12 +65,18 @@ async function getMetafield(customerId, key) {
 
 async function setMetafield(customerId, key, value, type = 'integer') {
   const existing = await getMetafield(customerId, key);
+
+  let mfType, mfValue;
+  if (type === 'json')    { mfType = 'json';            mfValue = JSON.stringify(value); }
+  else if (type === 'date') { mfType = 'date';          mfValue = String(value); }
+  else                    { mfType = 'number_integer';   mfValue = String(value); }
+
   const body = {
     metafield: {
       namespace: 'rewards',
       key,
-      value: type === 'json' ? JSON.stringify(value) : String(value),
-      type:  type === 'json' ? 'json' : 'number_integer'
+      value:     mfValue,
+      type:      mfType
     }
   };
   if (existing) {
@@ -197,7 +203,11 @@ app.get('/api/points', async (req, res) => {
     balance = result.balance;
     history = result.history;
 
-    res.json({ balance, history: history.slice(0, 20), is_first_order: false });
+    // Check if birthday is set
+    const birthdayMF  = await getMetafield(customer_id, 'birthday');
+    const has_birthday = !!birthdayMF;
+
+    res.json({ balance, history: history.slice(0, 20), is_first_order: false, has_birthday });
   } catch (e) {
     console.error('[points GET]', e.message);
     res.status(500).json({ error: e.message });
@@ -902,6 +912,143 @@ app.post('/api/admin/set-points', async (req, res) => {
     console.error('[admin/set-points]', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+/* ─────────────────────────────────────────
+   ROUTE: POST /api/save-birthday
+   Called via App Proxy when customer submits their birthday.
+   Saves birthday to rewards/birthday metafield.
+   ───────────────────────────────────────── */
+app.post('/api/save-birthday', async (req, res) => {
+  const { customer_id, birthday } = req.body;
+  if (!customer_id || !birthday) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+
+  // Validate date format YYYY-MM-DD
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(birthday)) {
+    return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+  }
+
+  try {
+    await setMetafield(customer_id, 'birthday', birthday, 'date');
+    console.log(`[save-birthday] Customer ${customer_id}: birthday saved as ${birthday}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[save-birthday]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ─────────────────────────────────────────
+   ROUTE: GET /api/cron/birthday
+   Run daily via external cron (cron-job.org or similar).
+   Finds customers whose birthday is today and awards points.
+   Protected by ADMIN_SECRET.
+
+   Setup: add a daily cron job at midnight hitting:
+   GET https://your-railway-url.up.railway.app/api/cron/birthday?secret=YOUR_ADMIN_SECRET
+   ───────────────────────────────────────── */
+const BIRTHDAY_POINTS = 100; // points awarded on birthday
+
+app.get('/api/cron/birthday', async (req, res) => {
+  const { secret } = req.query;
+  const ADMIN_SECRET = process.env.ADMIN_SECRET;
+  if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  const today    = new Date();
+  const todayMM  = String(today.getMonth() + 1).padStart(2, '0');
+  const todayDD  = String(today.getDate()).padStart(2, '0');
+  const todayKey = `${todayMM}-${todayDD}`; // e.g. "06-29"
+
+  console.log(`[cron/birthday] Running for ${todayKey}`);
+
+  let awarded = 0;
+  let skipped = 0;
+  let page    = `https://${SHOP}/admin/api/2025-04/customers.json?limit=250&fields=id,email,metafields`;
+
+  // Page through all customers
+  while (page) {
+    const res2 = await fetch(page, { headers: HEADERS });
+    if (!res2.ok) {
+      console.error('[cron/birthday] Failed to fetch customers:', res2.status);
+      break;
+    }
+
+    const data      = await res2.json();
+    const customers = data.customers || [];
+
+    for (const customer of customers) {
+      try {
+        // Get birthday metafield for this customer
+        const bdayMF = await getMetafield(customer.id, 'birthday');
+        if (!bdayMF) continue;
+
+        const bday = bdayMF.value; // format: YYYY-MM-DD
+        const [, mm, dd] = bday.split('-');
+        if (`${mm}-${dd}` !== todayKey) continue;
+
+        // Check if already awarded this year
+        const historyMF = await getMetafield(customer.id, 'history');
+        let history = [];
+        if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+        const thisYear         = today.getFullYear();
+        const alreadyAwarded   = history.some(h =>
+          h.is_birthday &&
+          new Date(h.created_at).getFullYear() === thisYear
+        );
+
+        if (alreadyAwarded) {
+          console.log(`[cron/birthday] Customer ${customer.id}: already awarded this year`);
+          skipped++;
+          continue;
+        }
+
+        // Award birthday points
+        const balanceMF  = await getMetafield(customer.id, 'balance');
+        const balance    = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+        const newBalance = balance + BIRTHDAY_POINTS;
+
+        const expiresAt = new Date();
+        expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
+
+        history.unshift({
+          type:             'earn',
+          description:      'Birthday bonus 🎂',
+          points:           BIRTHDAY_POINTS,
+          remaining_points: BIRTHDAY_POINTS,
+          created_at:       new Date().toISOString(),
+          expires_at:       expiresAt.toISOString(),
+          is_birthday:      true
+        });
+
+        await Promise.all([
+          setMetafield(customer.id, 'balance', newBalance, 'integer'),
+          setMetafield(customer.id, 'history', history, 'json')
+        ]);
+
+        console.log(`[cron/birthday] Customer ${customer.id} (${customer.email}): +${BIRTHDAY_POINTS} pts. Balance: ${balance} → ${newBalance}`);
+        awarded++;
+
+        // Small delay between customers to avoid rate limiting
+        await new Promise(r => setTimeout(r, 300));
+
+      } catch (e) {
+        console.error(`[cron/birthday] Error for customer ${customer.id}:`, e.message);
+      }
+    }
+
+    // Handle pagination via Link header
+    const linkHeader = res2.headers.get('link');
+    const nextMatch  = linkHeader?.match(/<([^>]+)>;\s*rel="next"/);
+    page = nextMatch ? nextMatch[1] : null;
+  }
+
+  console.log(`[cron/birthday] Done. Awarded: ${awarded}, Skipped: ${skipped}`);
+  res.json({ ok: true, awarded, skipped, date: todayKey });
 });
 
 /* ── Start ── */
