@@ -39,13 +39,14 @@ const HEADERS = {
    ───────────────────────────────────────── */
 
 async function shopifyFetch(path, options = {}) {
-  const res = await fetch(`https://${SHOP}/admin/api/2025-04${path}`, {
+  const url = `https://${SHOP}/admin/api/2025-04${path}`;
+  const res = await fetch(url, {
     ...options,
     headers: { ...HEADERS, ...options.headers }
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Shopify API error ${res.status}: ${text}`);
+    throw new Error(`Shopify API error ${res.status} on ${options.method || 'GET'} ${path}: ${text}`);
   }
   // DELETE returns 204 No Content — don't parse
   if (res.status === 204) return {};
@@ -660,7 +661,7 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
     }
 
     if (pointsDeducted === 0 && pointsCredited === 0) {
-      console.log(`[order-cancelled] Nothing to adjust for order #${orderNumber}`);
+      console.log(`[order-cancelled] Order #${orderNumber}: no points to adjust`);
       return res.status(200).send('ok');
     }
 
@@ -713,6 +714,7 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
   const orderId = String(refund.order_id);
   let order;
   try {
+    console.log(`[refund-created] Fetching order ${orderId}`);
     const data = await shopifyFetch(
       `/orders/${orderId}.json?fields=id,order_number,total_price,discount_codes,financial_status,customer`
     );
