@@ -5,12 +5,28 @@
  *   SHOPIFY_SHOP          = cilvira-2.myshopify.com
  *   SHOPIFY_ACCESS_TOKEN  = shpat_xxxx
  *   SHOPIFY_API_SECRET    = xxxx  (from Shopify Admin → Settings → Notifications → Webhooks)
- *   ADMIN_SECRET          = your-chosen-password  (for /api/admin/set-points)
+ *   ADMIN_SECRET          = your-chosen-password  (for /api/admin/add-points, /api/admin/deduct-points, /api/cron/birthday)
  *
  * Bonus coupon: FREE50
- *   Orders using this coupon earn 50% of amount paid (after discount) as points.
+ *   Orders using this coupon earn 100% of amount paid (after discount) as points.
  *   All other orders earn 1% of amount paid (after discount).
  *   To change the coupon name, update BONUS_COUPON below and redeploy.
+ *
+ * Points expiry: every earn-type credit (purchase, welcome, birthday, manual)
+ *   carries its own expires_at and expires independently, 6 months after credit
+ *   by default. Manual credits require an explicit expires_at instead of using
+ *   the default window — see /api/admin/add-points below.
+ *
+ * Birthday points: awarded once per calendar year, on the 1st of the customer's
+ *   birth month, and expire at the end of that same month. The external cron
+ *   trigger for /api/cron/birthday must be scheduled monthly (1st of month),
+ *   not daily — see the route comment below.
+ *
+ * Manual point admin: no admin panel exists. Credits/debits are sent by hand
+ *   via ReqBin (or similar) as raw POST requests. There is deliberately no
+ *   "set balance to X" action — only additive add-points / deduct-points —
+ *   because a typo in a "set" call silently overwrites the whole balance with
+ *   no way to detect the error after the fact.
  */
 
 const express = require('express');
@@ -26,8 +42,8 @@ app.use((req, res, next) => {
 const SHOP         = process.env.SHOPIFY_SHOP;
 const TOKEN        = process.env.SHOPIFY_ACCESS_TOKEN;
 const SECRET       = process.env.SHOPIFY_API_SECRET;
-const BONUS_COUPON         = 'FREE50'; // change this to update the 50% bonus trigger
-const POINTS_EXPIRY_MONTHS = 6;        // points expire 6 months after being earned
+const BONUS_COUPON         = 'FREE50'; // change this to update the 100% bonus trigger
+const POINTS_EXPIRY_MONTHS = 6;        // default expiry window for purchase/welcome/birthday points
 
 const HEADERS = {
   'X-Shopify-Access-Token': TOKEN,
@@ -123,6 +139,9 @@ async function deleteRwrdCode(code) {
    from balance, marks entries as expired.
    Returns { balance, history, expired } — expired = pts removed this call.
    Called on every /api/points GET so expiry is always up to date.
+   Each earn entry carries its own expires_at, so entries from different
+   sources (purchase, welcome, birthday, manual) expire independently —
+   no entry's expiry is affected by any other entry's schedule.
    ───────────────────────────────────────── */
 async function processExpiry(customerId, balance, history) {
   const now              = Date.now();
@@ -538,8 +557,8 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-paid
    Awards points after a completed purchase.
-   Bonus coupon FREE50 → 50% of amount paid.
-   All other orders → 1% of amount paid.
+   Bonus coupon FREE50 → 100% of amount paid as points.
+   All other orders → 1% of amount paid as points.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) {
@@ -585,7 +604,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
     history.unshift({
       type:             'earn',
-      description:      `Order #${order.order_number} — ${earnedPoints} pts earned${usedBonusCoupon ? ' (50% bonus)' : ''}`,
+      description:      `Order #${order.order_number} — ${earnedPoints} pts earned${usedBonusCoupon ? ' (100% bonus)' : ''}`,
       points:           earnedPoints,
       remaining_points: earnedPoints, // tracked for partial expiry accuracy
       created_at:       new Date().toISOString(),
@@ -615,7 +634,8 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-cancelled
-   Reverses earned points and refunds used points.
+   Reverses earned points and refunds used points — immediately,
+   in the same request that receives Shopify's cancellation event.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) {
@@ -648,9 +668,10 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
       h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed
     );
     if (earnEntry) {
-      pointsDeducted     = earnEntry.points;
-      earnEntry.reversed = true;
-      balance            = Math.max(0, balance - pointsDeducted);
+      pointsDeducted             = earnEntry.points;
+      earnEntry.reversed         = true;
+      earnEntry.remaining_points = 0; // zero out so expiry never re-touches a reversed entry
+      balance                    = Math.max(0, balance - pointsDeducted);
       console.log(`[order-cancelled] Reversing ${pointsDeducted} earned pts`);
     }
 
@@ -708,8 +729,8 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/refund-created
-   Partial refund → proportional point reversal.
-   Full refund    → full reversal + credit back redeemed points.
+   Partial refund → proportional point reversal, applied immediately.
+   Full refund    → full reversal + credit back redeemed points, immediately.
    ───────────────────────────────────────── */
 app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) {
@@ -764,12 +785,19 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
     );
     if (earnEntry && earnEntry.points > 0) {
       if (isFullRefund) {
-        pointsDeducted     = earnEntry.points;
-        earnEntry.reversed = true;
+        pointsDeducted             = earnEntry.points;
+        earnEntry.reversed         = true;
+        earnEntry.remaining_points = 0; // zero out — nothing left for expiry to touch
       } else {
-        const ratio       = Math.min(1, refundAmount / originalTotal);
-        pointsDeducted    = Math.floor(earnEntry.points * ratio);
-        earnEntry.points -= pointsDeducted;
+        const ratio        = Math.min(1, refundAmount / originalTotal);
+        pointsDeducted      = Math.floor(earnEntry.points * ratio);
+        earnEntry.points   -= pointsDeducted;
+        // Keep remaining_points in sync with the reduced entry so a later
+        // expiry sweep can't expire points that were already clawed back here.
+        earnEntry.remaining_points = Math.max(
+          0,
+          (earnEntry.remaining_points ?? (earnEntry.points + pointsDeducted)) - pointsDeducted
+        );
       }
       balance = Math.max(0, balance - pointsDeducted);
       console.log(`[refund-created] Reversing ${pointsDeducted} pts (${isFullRefund ? 'full' : 'partial'})`);
@@ -825,18 +853,14 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
 });
 
 /* ─────────────────────────────────────────
-   ROUTE: POST /api/admin/set-points
-   Manually adjust a customer's points balance.
-   Protected by ADMIN_SECRET env variable.
-   Body: { secret, customer_id, action, points, note }
-   action: 'set' | 'add' | 'deduct'
+   ADMIN AUTH + RATE LIMIT
+   Shared by every ReqBin-triggered admin route below. 5 attempts per IP
+   per 15-minute window; a correct secret clears the counter for that IP.
    ───────────────────────────────────────── */
 const adminAttempts = new Map();
 
-app.post('/api/admin/set-points', async (req, res) => {
-  const { secret, customer_id, action, points, note } = req.body;
-
-  // Rate limiting: 5 attempts per IP per 15 minutes
+function requireAdminAuth(req, res, next) {
+  const secret = req.body?.secret ?? req.query?.secret;
   const ip     = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
   const now    = Date.now();
   const window = 15 * 60 * 1000;
@@ -855,14 +879,38 @@ app.post('/api/admin/set-points', async (req, res) => {
   }
 
   adminAttempts.delete(ip);
+  next();
+}
 
-  if (!customer_id || !action || points === undefined) {
-    return res.status(400).json({ error: 'Missing fields: customer_id, action, points' });
+/* ─────────────────────────────────────────
+   ROUTE: POST /api/admin/add-points
+   Adds points to a customer's current balance. Always additive — there is
+   no "set balance to X" action, since a mistyped absolute value would
+   silently overwrite the real balance with no way to detect the error.
+   Every credit becomes its own history entry with its own expiry, so
+   multiple manual credits to the same customer expire independently and
+   correctly, exactly like purchase-earned points do.
+   Body: { secret, customer_id, points, expires_at, note }
+   expires_at: required, format YYYY-MM-DD, must be a future date.
+   ───────────────────────────────────────── */
+app.post('/api/admin/add-points', requireAdminAuth, async (req, res) => {
+  const { customer_id, points, expires_at, note } = req.body;
+
+  if (!customer_id || points === undefined || !expires_at) {
+    return res.status(400).json({ error: 'Required: customer_id, points, expires_at (YYYY-MM-DD)' });
   }
 
   const ptsInt = parseInt(points, 10);
-  if (isNaN(ptsInt) || ptsInt < 0) {
-    return res.status(400).json({ error: 'Invalid points value' });
+  if (isNaN(ptsInt) || ptsInt <= 0) {
+    return res.status(400).json({ error: 'points must be a positive integer' });
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(expires_at)) {
+    return res.status(400).json({ error: 'expires_at must be YYYY-MM-DD' });
+  }
+  const expiryDate = new Date(`${expires_at}T23:59:59`);
+  if (isNaN(expiryDate.getTime()) || expiryDate <= new Date()) {
+    return res.status(400).json({ error: 'expires_at must be a valid future date' });
   }
 
   try {
@@ -872,32 +920,15 @@ app.post('/api/admin/set-points', async (req, res) => {
     let history     = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    let newBalance, description;
-
-    if (action === 'set') {
-      newBalance  = ptsInt;
-      description = note || `Balance set to ${ptsInt} pts`;
-    } else if (action === 'add') {
-      newBalance  = current + ptsInt;
-      description = note || `${ptsInt} pts added`;
-    } else if (action === 'deduct') {
-      newBalance  = Math.max(0, current - ptsInt);
-      description = note || `${ptsInt} pts deducted`;
-    } else {
-      return res.status(400).json({ error: 'action must be: set | add | deduct' });
-    }
-
-    const adminExpiresAt = new Date();
-    adminExpiresAt.setMonth(adminExpiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
-    const addedPts = action === 'deduct' ? ptsInt : newBalance - current;
+    const newBalance = current + ptsInt;
 
     history.unshift({
-      type:             action === 'deduct' ? 'use' : 'earn',
-      description:      description,
-      points:           addedPts,
-      remaining_points: action === 'deduct' ? undefined : addedPts,
+      type:             'earn',
+      description:      note || `${ptsInt} pts added manually`,
+      points:           ptsInt,
+      remaining_points: ptsInt,
       created_at:       new Date().toISOString(),
-      expires_at:       action === 'deduct' ? undefined : adminExpiresAt.toISOString(),
+      expires_at:       expiryDate.toISOString(),
       is_manual:        true
     });
 
@@ -906,10 +937,59 @@ app.post('/api/admin/set-points', async (req, res) => {
       setMetafield(customer_id, 'history', history, 'json')
     ]);
 
-    console.log(`[admin] Customer ${customer_id}: ${action} ${ptsInt}pts → balance: ${current} → ${newBalance}`);
+    console.log(`[admin/add-points] Customer ${customer_id}: +${ptsInt}pts → balance ${current} → ${newBalance}, expires ${expires_at}`);
+    res.json({ ok: true, previous_balance: current, new_balance: newBalance, expires_at: expiryDate.toISOString() });
+  } catch (e) {
+    console.error('[admin/add-points]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ─────────────────────────────────────────
+   ROUTE: POST /api/admin/deduct-points
+   Deducts points from a customer's current balance. No expiry needed —
+   this creates a 'use' entry, not new points entering the system, so it
+   is never touched by the expiry sweep. Balance floors at zero.
+   Body: { secret, customer_id, points, note }
+   ───────────────────────────────────────── */
+app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
+  const { customer_id, points, note } = req.body;
+
+  if (!customer_id || points === undefined) {
+    return res.status(400).json({ error: 'Required: customer_id, points' });
+  }
+
+  const ptsInt = parseInt(points, 10);
+  if (isNaN(ptsInt) || ptsInt <= 0) {
+    return res.status(400).json({ error: 'points must be a positive integer' });
+  }
+
+  try {
+    const balanceMF = await getMetafield(customer_id, 'balance');
+    const current   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+    const historyMF = await getMetafield(customer_id, 'history');
+    let history     = [];
+    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+    const newBalance = Math.max(0, current - ptsInt);
+
+    history.unshift({
+      type:        'use',
+      description: note || `${ptsInt} pts deducted manually`,
+      points:      ptsInt,
+      created_at:  new Date().toISOString(),
+      is_manual:   true
+    });
+
+    await Promise.all([
+      setMetafield(customer_id, 'balance', newBalance, 'integer'),
+      setMetafield(customer_id, 'history', history, 'json')
+    ]);
+
+    console.log(`[admin/deduct-points] Customer ${customer_id}: -${ptsInt}pts → balance ${current} → ${newBalance}`);
     res.json({ ok: true, previous_balance: current, new_balance: newBalance });
   } catch (e) {
-    console.error('[admin/set-points]', e.message);
+    console.error('[admin/deduct-points]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -942,14 +1022,23 @@ app.post('/api/save-birthday', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: GET /api/cron/birthday
-   Run daily via external cron (cron-job.org or similar).
-   Finds customers whose birthday is today and awards points.
+   Run monthly, on the 1st, via external cron (cron-job.org or similar).
+   Awards points to every customer whose birthday falls in the CURRENT
+   MONTH (day-of-month is ignored — a May 15 birthday and a May 1
+   birthday are treated identically). Points expire at 23:59:59 on the
+   last day of that same month, regardless of which day of the month
+   the cron actually fires on.
    Protected by ADMIN_SECRET.
 
-   Setup: add a daily cron job at midnight hitting:
+   Cron schedule required: 0 0 1 * *  (00:00 on the 1st of every month)
+   NOT daily — a daily schedule would still only award once per year per
+   customer (guarded by the alreadyAwarded check below), but the day-1
+   guard means every non-1st invocation would just no-op, which is
+   harmless but pointless. Update the external cron schedule accordingly.
+
    GET https://your-railway-url.up.railway.app/api/cron/birthday?secret=YOUR_ADMIN_SECRET
    ───────────────────────────────────────── */
-const BIRTHDAY_POINTS = 100; // points awarded on birthday
+const BIRTHDAY_POINTS = 100; // points awarded once per year, in the birth month
 
 app.get('/api/cron/birthday', async (req, res) => {
   const { secret } = req.query;
@@ -958,12 +1047,26 @@ app.get('/api/cron/birthday', async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const today    = new Date();
-  const todayMM  = String(today.getMonth() + 1).padStart(2, '0');
-  const todayDD  = String(today.getDate()).padStart(2, '0');
-  const todayKey = `${todayMM}-${todayDD}`; // e.g. "06-29"
+  const today      = new Date();
+  const todayMonth = today.getMonth() + 1; // 1-12
+  const thisYear   = today.getFullYear();
 
-  console.log(`[cron/birthday] Running for ${todayKey}`);
+  // Defense-in-depth: this route is meant to run once, on the 1st of each
+  // month. If it ever fires on another day (misconfigured cron, manual
+  // trigger, retry), skip instead of mis-awarding for the wrong window.
+  if (today.getDate() !== 1) {
+    return res.json({
+      ok: true,
+      skipped_reason: 'not_first_of_month',
+      date: today.toISOString().slice(0, 10)
+    });
+  }
+
+  // Last moment of this month — the expiry for every birthday credit awarded today
+  const monthEnd     = new Date(thisYear, todayMonth, 0, 23, 59, 59);
+  const expiresAtISO = monthEnd.toISOString();
+
+  console.log(`[cron/birthday] Running for birth-month ${todayMonth}. Points expire ${expiresAtISO}`);
 
   let awarded = 0;
   let skipped = 0;
@@ -987,16 +1090,15 @@ app.get('/api/cron/birthday', async (req, res) => {
         if (!bdayMF) continue;
 
         const bday = bdayMF.value; // format: YYYY-MM-DD
-        const [, mm, dd] = bday.split('-');
-        if (`${mm}-${dd}` !== todayKey) continue;
+        const [, mm] = bday.split('-');
+        if (parseInt(mm, 10) !== todayMonth) continue;
 
         // Check if already awarded this year
         const historyMF = await getMetafield(customer.id, 'history');
         let history = [];
         if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-        const thisYear         = today.getFullYear();
-        const alreadyAwarded   = history.some(h =>
+        const alreadyAwarded = history.some(h =>
           h.is_birthday &&
           new Date(h.created_at).getFullYear() === thisYear
         );
@@ -1012,16 +1114,13 @@ app.get('/api/cron/birthday', async (req, res) => {
         const balance    = balanceMF ? parseInt(balanceMF.value, 10) : 0;
         const newBalance = balance + BIRTHDAY_POINTS;
 
-        const expiresAt = new Date();
-        expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
-
         history.unshift({
           type:             'earn',
-          description:      'Birthday bonus 🎂',
+          description:      'Birthday bonus 🎂 — expires end of this month',
           points:           BIRTHDAY_POINTS,
           remaining_points: BIRTHDAY_POINTS,
           created_at:       new Date().toISOString(),
-          expires_at:       expiresAt.toISOString(),
+          expires_at:       expiresAtISO,
           is_birthday:      true
         });
 
@@ -1030,7 +1129,7 @@ app.get('/api/cron/birthday', async (req, res) => {
           setMetafield(customer.id, 'history', history, 'json')
         ]);
 
-        console.log(`[cron/birthday] Customer ${customer.id} (${customer.email}): +${BIRTHDAY_POINTS} pts. Balance: ${balance} → ${newBalance}`);
+        console.log(`[cron/birthday] Customer ${customer.id} (${customer.email}): +${BIRTHDAY_POINTS} pts. Balance: ${balance} → ${newBalance}. Expires ${expiresAtISO}`);
         awarded++;
 
         // Small delay between customers to avoid rate limiting
@@ -1048,7 +1147,7 @@ app.get('/api/cron/birthday', async (req, res) => {
   }
 
   console.log(`[cron/birthday] Done. Awarded: ${awarded}, Skipped: ${skipped}`);
-  res.json({ ok: true, awarded, skipped, date: todayKey });
+  res.json({ ok: true, awarded, skipped, birth_month: todayMonth, expires_at: expiresAtISO });
 });
 
 /* ── Start ── */
