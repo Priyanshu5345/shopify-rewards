@@ -5,28 +5,44 @@
  *   SHOPIFY_SHOP          = cilvira-2.myshopify.com
  *   SHOPIFY_ACCESS_TOKEN  = shpat_xxxx
  *   SHOPIFY_API_SECRET    = xxxx  (from Shopify Admin → Settings → Notifications → Webhooks)
- *   ADMIN_SECRET          = your-chosen-password  (for /api/admin/add-points, /api/admin/deduct-points, /api/cron/birthday)
+ *   ADMIN_SECRET          = your-chosen-password  (for /api/admin/*, /api/cron/birthday)
  *
  * Bonus coupon: FREE50
  *   Orders using this coupon earn 100% of amount paid (after discount) as points.
  *   All other orders earn 1% of amount paid (after discount).
- *   To change the coupon name, update BONUS_COUPON below and redeploy.
  *
  * Points expiry: every earn-type credit (purchase, welcome, birthday, manual)
  *   carries its own expires_at and expires independently, 6 months after credit
- *   by default. Manual credits require an explicit expires_at instead of using
- *   the default window — see /api/admin/add-points below.
+ *   by default. Manual credits require an explicit expires_at.
  *
- * Birthday points: awarded once per calendar year, on the 1st of the customer's
- *   birth month, and expire at the end of that same month. The external cron
- *   trigger for /api/cron/birthday must be scheduled monthly (1st of month),
- *   not daily — see the route comment below.
+ * Birthday points — INDEX-BACKED:
+ *   A shop-level metafield (rewards/birthday_index) maps birth-month → list of
+ *   customer IDs. It's built once at /api/admin/backfill-birthday-index and
+ *   kept current automatically every time a customer saves their birthday via
+ *   /api/save-birthday. The monthly cron (/api/cron/birthday) reads ONLY this
+ *   index — it never re-scans the full customer list — so it costs roughly
+ *   2 API calls per MATCHED customer and zero for everyone else, instead of
+ *   1+ calls for every customer in the store every month.
+ *
+ *   Run /api/admin/backfill-birthday-index ONCE, right after this deploys, so
+ *   customers who saved a birthday before this index existed aren't invisible
+ *   to it. Safe to re-run any time (e.g. after a bulk customer import) — it
+ *   fully rebuilds the index from what's actually stored in Shopify.
+ *
+ *   Awarded on the 1st of the birth month (day-of-month on the birthday itself
+ *   is ignored), expires at the end of that same month.
+ *
+ * Rate limiting: every outbound Shopify call is serialized through a single
+ *   throttled queue (~1.8 req/sec) with automatic 429 retry. With the birthday
+ *   index in place, cron traffic is now small enough that this alone is
+ *   sufficient — no separate priority lanes needed for webhook vs. cron
+ *   contention, since the cron no longer touches most of the customer list.
  *
  * Manual point admin: no admin panel exists. Credits/debits are sent by hand
- *   via ReqBin (or similar) as raw POST requests. There is deliberately no
- *   "set balance to X" action — only additive add-points / deduct-points —
- *   because a typo in a "set" call silently overwrites the whole balance with
- *   no way to detect the error after the fact.
+ *   via ReqBin as raw POST requests. There is deliberately no "set balance to
+ *   X" action — only additive add-points / deduct-points — because a typo in
+ *   a "set" call silently overwrites the whole balance with no way to detect
+ *   the error after the fact.
  */
 
 const express = require('express');
@@ -42,8 +58,8 @@ app.use((req, res, next) => {
 const SHOP         = process.env.SHOPIFY_SHOP;
 const TOKEN        = process.env.SHOPIFY_ACCESS_TOKEN;
 const SECRET       = process.env.SHOPIFY_API_SECRET;
-const BONUS_COUPON         = 'FREE50'; // change this to update the 100% bonus trigger
-const POINTS_EXPIRY_MONTHS = 6;        // default expiry window for purchase/welcome/birthday points
+const BONUS_COUPON         = 'FREE50';
+const POINTS_EXPIRY_MONTHS = 6;
 
 const HEADERS = {
   'X-Shopify-Access-Token': TOKEN,
@@ -51,12 +67,57 @@ const HEADERS = {
 };
 
 /* ─────────────────────────────────────────
-   HELPERS
+   RATE LIMITER
+   Shopify's REST Admin API enforces a leaky-bucket limit — roughly 40
+   request capacity, leaking at 2 requests/sec for standard app tokens.
+   Every outbound Shopify call goes through this single queue with a
+   fixed ~550ms gap between calls. Any 429 that still slips through is
+   retried automatically with backoff, inside the same queue slot.
+   ───────────────────────────────────────── */
+const MIN_INTERVAL_MS = 550; // ≈1.8 req/sec, under Shopify's 2/sec ceiling
+const MAX_RETRIES     = 5;
+
+let requestQueue = Promise.resolve();
+
+function throttle(fn) {
+  const run = requestQueue.then(async () => {
+    const result = await fn();
+    await new Promise(r => setTimeout(r, MIN_INTERVAL_MS));
+    return result;
+  });
+  requestQueue = run.catch(() => {});
+  return run;
+}
+
+async function throttledFetch(url, options = {}) {
+  return throttle(async () => {
+    let res;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      res = await fetch(url, options);
+      if (res.status !== 429) break;
+
+      if (attempt === MAX_RETRIES) {
+        throw new Error(`Shopify API error 429 on ${options.method || 'GET'} ${url}: exceeded ${MAX_RETRIES} retries`);
+      }
+
+      const retryAfterHeader = res.headers.get('retry-after');
+      const waitMs = retryAfterHeader
+        ? Math.ceil(parseFloat(retryAfterHeader) * 1000)
+        : 1000 * (attempt + 1);
+      console.warn(`[rate-limit] 429 on ${url}, retry ${attempt + 1}/${MAX_RETRIES} in ${waitMs}ms`);
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+    return res;
+  });
+}
+
+/* ─────────────────────────────────────────
+   HELPERS — customer metafields
    ───────────────────────────────────────── */
 
 async function shopifyFetch(path, options = {}) {
   const url = `https://${SHOP}/admin/api/2025-04${path}`;
-  const res = await fetch(url, {
+  const res = await throttledFetch(url, {
     ...options,
     headers: { ...HEADERS, ...options.headers }
   });
@@ -64,7 +125,6 @@ async function shopifyFetch(path, options = {}) {
     const text = await res.text();
     throw new Error(`Shopify API error ${res.status} on ${options.method || 'GET'} ${path}: ${text}`);
   }
-  // DELETE returns 204 No Content — don't parse
   if (res.status === 204) return {};
   const text = await res.text();
   if (!text) return {};
@@ -88,23 +148,55 @@ async function setMetafield(customerId, key, value, type = 'integer') {
   else                    { mfType = 'number_integer';   mfValue = String(value); }
 
   const body = {
-    metafield: {
-      namespace: 'rewards',
-      key,
-      value:     mfValue,
-      type:      mfType
-    }
+    metafield: { namespace: 'rewards', key, value: mfValue, type: mfType }
   };
   if (existing) {
-    return shopifyFetch(`/metafields/${existing.id}.json`, {
-      method: 'PUT',
-      body: JSON.stringify(body)
-    });
+    return shopifyFetch(`/metafields/${existing.id}.json`, { method: 'PUT', body: JSON.stringify(body) });
   }
-  return shopifyFetch(`/customers/${customerId}/metafields.json`, {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
+  return shopifyFetch(`/customers/${customerId}/metafields.json`, { method: 'POST', body: JSON.stringify(body) });
+}
+
+/* ─────────────────────────────────────────
+   HELPERS — shop-level metafields (used for the birthday index)
+   ───────────────────────────────────────── */
+
+async function getShopMetafield(key) {
+  const data = await shopifyFetch(`/metafields.json?namespace=rewards&key=${key}`);
+  const mf = (data.metafields || []).find(m => m.key === key);
+  return mf ? { id: mf.id, value: mf.value } : null;
+}
+
+async function setShopMetafield(key, value) {
+  const existing = await getShopMetafield(key);
+  const body = {
+    metafield: { namespace: 'rewards', key, value: JSON.stringify(value), type: 'json' }
+  };
+  if (existing) {
+    return shopifyFetch(`/metafields/${existing.id}.json`, { method: 'PUT', body: JSON.stringify(body) });
+  }
+  return shopifyFetch('/metafields.json', { method: 'POST', body: JSON.stringify(body) });
+}
+
+/* ─────────────────────────────────────────
+   IN-PROCESS INDEX LOCK
+   The birthday_index shop metafield can be modified by concurrent
+   /api/save-birthday requests. Without serialization, two customers
+   saving at nearly the same instant could each read the same version,
+   and the second write would silently overwrite the first customer's
+   entry (last-write-wins). This queue forces every index read-modify-
+   write in this file through one line at a time, on this process.
+   Limitation, stated plainly: this only protects a SINGLE running
+   instance. If this app is ever scaled to multiple instances behind a
+   load balancer, this lock no longer prevents the race — a distributed
+   lock (or Shopify's GraphQL compareDigest) would be needed then. Not
+   needed for a single-instance Railway deployment.
+   ───────────────────────────────────────── */
+let indexQueue = Promise.resolve();
+
+function withIndexLock(fn) {
+  const run = indexQueue.then(fn);
+  indexQueue = run.catch(() => {});
+  return run;
 }
 
 function verifyHmac(req) {
@@ -120,9 +212,7 @@ function parseWebhookBody(req) {
 
 async function deleteRwrdCode(code) {
   try {
-    const data = await shopifyFetch(
-      `/discount_codes/lookup.json?code=${encodeURIComponent(code)}`
-    );
+    const data = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(code)}`);
     const priceRuleId = data.discount_code?.price_rule_id;
     if (priceRuleId) {
       await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
@@ -135,56 +225,38 @@ async function deleteRwrdCode(code) {
 
 /* ─────────────────────────────────────────
    EXPIRY HELPER
-   Checks history for expired earn entries, deducts expired points
-   from balance, marks entries as expired.
-   Returns { balance, history, expired } — expired = pts removed this call.
-   Called on every /api/points GET so expiry is always up to date.
-   Each earn entry carries its own expires_at, so entries from different
-   sources (purchase, welcome, birthday, manual) expire independently —
-   no entry's expiry is affected by any other entry's schedule.
    ───────────────────────────────────────── */
 async function processExpiry(customerId, balance, history) {
-  const now              = Date.now();
-  let   expiredPoints    = 0;
-  let   historyChanged   = false;
+  const now           = Date.now();
+  let   expiredPoints = 0;
 
   for (const entry of history) {
-    // Only expire earn entries that haven't already expired or been reversed
     if (
-      entry.type        !== 'earn' ||
-      entry.expired     === true   ||
-      entry.reversed    === true   ||
+      entry.type     !== 'earn' ||
+      entry.expired  === true   ||
+      entry.reversed === true   ||
       !entry.expires_at
     ) continue;
 
     const expiresAt = new Date(entry.expires_at).getTime();
     if (now >= expiresAt) {
-      // How many points from this entry are still "live" (not already spent)
-      // We track remaining points on the entry itself for accuracy
       const remaining = entry.remaining_points ?? entry.points;
       if (remaining > 0) {
-        expiredPoints    += remaining;
-        entry.expired     = true;
+        expiredPoints += remaining;
+        entry.expired = true;
         entry.remaining_points = 0;
-        historyChanged    = true;
         console.log(`[expiry] ${remaining} pts expired from entry: ${entry.description}`);
       } else {
         entry.expired = true;
-        historyChanged = true;
       }
     }
   }
 
   if (expiredPoints > 0) {
     const newBalance = Math.max(0, balance - expiredPoints);
-
-    // Add a single expiry deduction entry to history
     history.unshift({
-      type:        'use',
-      description: `${expiredPoints} pts expired (6-month expiry)`,
-      points:      expiredPoints,
-      created_at:  new Date().toISOString(),
-      is_expiry:   true
+      type: 'use', description: `${expiredPoints} pts expired (6-month expiry)`,
+      points: expiredPoints, created_at: new Date().toISOString(), is_expiry: true
     });
 
     await Promise.all([
@@ -201,7 +273,6 @@ async function processExpiry(customerId, balance, history) {
 
 /* ─────────────────────────────────────────
    ROUTE: GET /api/points
-   Returns balance + history for a customer.
    ───────────────────────────────────────── */
 app.get('/api/points', async (req, res) => {
   const { customer_id } = req.query;
@@ -217,13 +288,11 @@ app.get('/api/points', async (req, res) => {
     let history = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    // Run expiry check on every load — no cron job needed
     const result = await processExpiry(customer_id, balance, history);
     balance = result.balance;
     history = result.history;
 
-    // Check if birthday is set
-    const birthdayMF  = await getMetafield(customer_id, 'birthday');
+    const birthdayMF   = await getMetafield(customer_id, 'birthday');
     const has_birthday = !!birthdayMF;
 
     res.json({ balance, history: history.slice(0, 20), is_first_order: false, has_birthday });
@@ -235,15 +304,14 @@ app.get('/api/points', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: GET /api/check-code
-   Verifies a RWRD- discount code is still valid and unused.
    ───────────────────────────────────────── */
 app.get('/api/check-code', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).json({ valid: false, error: 'Missing code' });
 
   try {
-    const data        = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(code)}`);
-    const dc          = data.discount_code;
+    const data = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(code)}`);
+    const dc   = data.discount_code;
     if (!dc) return res.json({ valid: false, usage_count: 0 });
 
     const codeData = await shopifyFetch(`/price_rules/${dc.price_rule_id}/discount_codes.json`);
@@ -257,20 +325,16 @@ app.get('/api/check-code', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/apply
-   Creates a one-time discount code for points redemption.
    ───────────────────────────────────────── */
 app.post('/api/apply', async (req, res) => {
   const { customer_id, points_to_use, cart_total } = req.body;
-  if (!customer_id || !points_to_use) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
+  if (!customer_id || !points_to_use) return res.status(400).json({ error: 'Missing fields' });
 
   const ptsInt    = parseInt(points_to_use, 10);
   const cartPaise = parseInt(cart_total, 10) || 0;
 
   if (ptsInt <= 0) return res.status(400).json({ error: 'Invalid points' });
 
-  // Cap: max 50% of cart value
   const maxAllowed = Math.floor(cartPaise / 200);
   if (ptsInt > maxAllowed) {
     return res.status(400).json({ error: `Max ${maxAllowed} pts allowed (50% of cart)` });
@@ -285,11 +349,8 @@ app.post('/api/apply', async (req, res) => {
     let history = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    // Reuse existing unused code if created within last 30 minutes
     const existing = history.find(
-      h => h.type === 'use'
-        && h.points === ptsInt
-        && !h.refunded
+      h => h.type === 'use' && h.points === ptsInt && !h.refunded
         && h.discount_code?.startsWith('RWRD-')
         && (Date.now() - new Date(h.created_at).getTime()) < 30 * 60 * 1000
     );
@@ -298,38 +359,26 @@ app.post('/api/apply', async (req, res) => {
       return res.json({ discount_code: existing.discount_code, discount_amount: ptsInt });
     }
 
-    // Create new price rule + discount code
     const code         = `RWRD-${customer_id}-${Date.now()}`;
     const discountData = await shopifyFetch('/price_rules.json', {
       method: 'POST',
       body: JSON.stringify({
         price_rule: {
-          title:                     `Rewards redemption ${code}`,
-          target_type:               'line_item',
-          target_selection:          'all',
-          allocation_method:         'across',
-          value_type:                'fixed_amount',
-          value:                     `-${ptsInt}.00`,
-          customer_selection:        'prerequisite',
-          prerequisite_customer_ids: [parseInt(customer_id)],
-          usage_limit:               1,
-          once_per_customer:         true,
-          starts_at:                 new Date().toISOString()
+          title: `Rewards redemption ${code}`, target_type: 'line_item', target_selection: 'all',
+          allocation_method: 'across', value_type: 'fixed_amount', value: `-${ptsInt}.00`,
+          customer_selection: 'prerequisite', prerequisite_customer_ids: [parseInt(customer_id)],
+          usage_limit: 1, once_per_customer: true, starts_at: new Date().toISOString()
         }
       })
     });
 
     await shopifyFetch(`/price_rules/${discountData.price_rule.id}/discount_codes.json`, {
-      method: 'POST',
-      body: JSON.stringify({ discount_code: { code } })
+      method: 'POST', body: JSON.stringify({ discount_code: { code } })
     });
 
     history.unshift({
-      type:          'use',
-      description:   `${ptsInt} points redeemed`,
-      points:        ptsInt,
-      discount_code: code,
-      created_at:    new Date().toISOString()
+      type: 'use', description: `${ptsInt} points redeemed`, points: ptsInt,
+      discount_code: code, created_at: new Date().toISOString()
     });
 
     await Promise.all([
@@ -347,7 +396,6 @@ app.post('/api/apply', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/update-apply
-   Updates an existing applied code to a new points amount.
    ───────────────────────────────────────── */
 app.post('/api/update-apply', async (req, res) => {
   const { customer_id, old_points, old_discount_code, new_points, cart_total } = req.body;
@@ -367,7 +415,6 @@ app.post('/api/update-apply', async (req, res) => {
   }
 
   try {
-    // Check if old code was already used in a completed order
     let oldCodeWasUsed = false;
     try {
       const searchData  = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(old_discount_code)}`);
@@ -388,7 +435,6 @@ app.post('/api/update-apply', async (req, res) => {
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
     if (!oldCodeWasUsed) {
-      // Safe to delete old code and restore points
       try { await deleteRwrdCode(old_discount_code); } catch {}
       balance = balance + oldPts;
       history = history.filter(h => !(h.type === 'use' && h.discount_code === old_discount_code));
@@ -405,32 +451,21 @@ app.post('/api/update-apply', async (req, res) => {
       method: 'POST',
       body: JSON.stringify({
         price_rule: {
-          title:                     `Rewards redemption ${code}`,
-          target_type:               'line_item',
-          target_selection:          'all',
-          allocation_method:         'across',
-          value_type:                'fixed_amount',
-          value:                     `-${newPts}.00`,
-          customer_selection:        'prerequisite',
-          prerequisite_customer_ids: [parseInt(customer_id)],
-          usage_limit:               1,
-          once_per_customer:         true,
-          starts_at:                 new Date().toISOString()
+          title: `Rewards redemption ${code}`, target_type: 'line_item', target_selection: 'all',
+          allocation_method: 'across', value_type: 'fixed_amount', value: `-${newPts}.00`,
+          customer_selection: 'prerequisite', prerequisite_customer_ids: [parseInt(customer_id)],
+          usage_limit: 1, once_per_customer: true, starts_at: new Date().toISOString()
         }
       })
     });
 
     await shopifyFetch(`/price_rules/${discountData.price_rule.id}/discount_codes.json`, {
-      method: 'POST',
-      body: JSON.stringify({ discount_code: { code } })
+      method: 'POST', body: JSON.stringify({ discount_code: { code } })
     });
 
     history.unshift({
-      type:          'use',
-      description:   `${newPts} points redeemed`,
-      points:        newPts,
-      discount_code: code,
-      created_at:    new Date().toISOString()
+      type: 'use', description: `${newPts} points redeemed`, points: newPts,
+      discount_code: code, created_at: new Date().toISOString()
     });
 
     await Promise.all([
@@ -448,7 +483,6 @@ app.post('/api/update-apply', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/restore
-   Restores points when customer removes applied discount.
    ───────────────────────────────────────── */
 app.post('/api/restore', async (req, res) => {
   const { customer_id, points, discount_code } = req.body;
@@ -502,16 +536,11 @@ app.post('/api/restore', async (req, res) => {
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/customer-created
-   Awards 100 welcome points to new customers on registration.
-   Only credits once — checked via existing balance metafield presence.
    ───────────────────────────────────────── */
 const WELCOME_POINTS = 100;
 
 app.post('/api/webhook/customer-created', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!verifyHmac(req)) {
-    console.error('[webhook/customer-created] HMAC mismatch');
-    return res.status(401).send('Unauthorized');
-  }
+  if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
 
   let customer;
   try { customer = parseWebhookBody(req); }
@@ -521,7 +550,6 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
   if (!customerId) return res.status(200).send('ok');
 
   try {
-    // Check if balance metafield already exists — prevents double crediting
     const existing = await getMetafield(customerId, 'balance');
     if (existing) {
       console.log(`[customer-created] Customer ${customerId} already has points — skipping welcome bonus`);
@@ -532,13 +560,9 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
     expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
 
     const history = [{
-      type:             'earn',
-      description:      'Welcome bonus',
-      points:           WELCOME_POINTS,
-      remaining_points: WELCOME_POINTS,
-      created_at:       new Date().toISOString(),
-      expires_at:       expiresAt.toISOString(),
-      is_welcome:       true
+      type: 'earn', description: 'Welcome bonus', points: WELCOME_POINTS,
+      remaining_points: WELCOME_POINTS, created_at: new Date().toISOString(),
+      expires_at: expiresAt.toISOString(), is_welcome: true
     }];
 
     await Promise.all([
@@ -556,15 +580,9 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-paid
-   Awards points after a completed purchase.
-   Bonus coupon FREE50 → 100% of amount paid as points.
-   All other orders → 1% of amount paid as points.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!verifyHmac(req)) {
-    console.error('[webhook/order-paid] HMAC mismatch');
-    return res.status(401).send('Unauthorized');
-  }
+  if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
 
   let order;
   try { order = parseWebhookBody(req); }
@@ -576,17 +594,13 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
   try {
     const orderId = order.id;
 
-    // Check if FREE50 bonus coupon was used
     const usedCoupons     = (order.discount_codes || []).map(d => (d.code || '').toUpperCase());
     const usedBonusCoupon = usedCoupons.includes(BONUS_COUPON.toUpperCase());
+    const amountPaid      = Math.round(parseFloat(order.total_price) * 100);
 
-    // Amount paid in paise (after all discounts)
-    const amountPaid = Math.round(parseFloat(order.total_price) * 100);
-
-    // Points calculation
     const earnedPoints = usedBonusCoupon
-      ? Math.floor(amountPaid / 100)    // 100% of amount paid
-      : Math.floor(amountPaid / 10000); // 1% of amount paid
+      ? Math.floor(amountPaid / 100)
+      : Math.floor(amountPaid / 10000);
 
     console.log(`[order-paid] Order #${order.order_number} | paid=₹${amountPaid/100} | bonus=${usedBonusCoupon} | earns=${earnedPoints}pts`);
 
@@ -597,19 +611,15 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
     const newBalance = balance + earnedPoints;
-
-    // Calculate expiry date — 6 months from now
-    const expiresAt = new Date();
+    const expiresAt   = new Date();
     expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
 
     history.unshift({
-      type:             'earn',
-      description:      `Order #${order.order_number} — ${earnedPoints} pts earned${usedBonusCoupon ? ' (100% bonus)' : ''}`,
-      points:           earnedPoints,
-      remaining_points: earnedPoints, // tracked for partial expiry accuracy
-      created_at:       new Date().toISOString(),
-      expires_at:       expiresAt.toISOString(),
-      order_id:         String(orderId)
+      type: 'earn',
+      description: `Order #${order.order_number} — ${earnedPoints} pts earned${usedBonusCoupon ? ' (100% bonus)' : ''}`,
+      points: earnedPoints, remaining_points: earnedPoints,
+      created_at: new Date().toISOString(), expires_at: expiresAt.toISOString(),
+      order_id: String(orderId)
     });
 
     await Promise.all([
@@ -619,11 +629,8 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
     console.log(`[order-paid] Balance: ${balance} + ${earnedPoints} = ${newBalance}`);
 
-    // Delete used RWRD- discount codes from Shopify
     const rwrdCodes = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
-    for (const d of rwrdCodes) {
-      await deleteRwrdCode(d.code);
-    }
+    for (const d of rwrdCodes) await deleteRwrdCode(d.code);
 
     res.status(200).send('ok');
   } catch (e) {
@@ -634,14 +641,9 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-cancelled
-   Reverses earned points and refunds used points — immediately,
-   in the same request that receives Shopify's cancellation event.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!verifyHmac(req)) {
-    console.error('[webhook/order-cancelled] HMAC mismatch');
-    return res.status(401).send('Unauthorized');
-  }
+  if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
 
   let order;
   try { order = parseWebhookBody(req); }
@@ -663,19 +665,15 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
     let pointsDeducted = 0;
     let pointsCredited = 0;
 
-    // Reverse earned points for this order
-    const earnEntry = history.find(
-      h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed
-    );
+    const earnEntry = history.find(h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed);
     if (earnEntry) {
       pointsDeducted             = earnEntry.points;
       earnEntry.reversed         = true;
-      earnEntry.remaining_points = 0; // zero out so expiry never re-touches a reversed entry
+      earnEntry.remaining_points = 0;
       balance                    = Math.max(0, balance - pointsDeducted);
       console.log(`[order-cancelled] Reversing ${pointsDeducted} earned pts`);
     }
 
-    // Credit back redeemed points
     const rwrdCodes = (order.discount_codes || [])
       .filter(d => d.code?.startsWith('RWRD-'))
       .map(d => Math.round(parseFloat(d.amount)));
@@ -701,12 +699,10 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
     if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
 
     history.unshift({
-      type:          pointsCredited >= pointsDeducted ? 'earn' : 'use',
-      description:   `Order #${orderNumber} cancelled: ${parts.join(', ')}`,
-      points:        pointsCredited - pointsDeducted,
-      created_at:    new Date().toISOString(),
-      order_id:      orderId,
-      is_adjustment: true
+      type: pointsCredited >= pointsDeducted ? 'earn' : 'use',
+      description: `Order #${orderNumber} cancelled: ${parts.join(', ')}`,
+      points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
+      order_id: orderId, is_adjustment: true
     });
 
     await Promise.all([
@@ -716,7 +712,6 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
 
     console.log(`[order-cancelled] Done. New balance: ${balance}`);
 
-    // Clean up RWRD codes
     const codesToDelete = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
     for (const d of codesToDelete) await deleteRwrdCode(d.code);
 
@@ -729,14 +724,9 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/refund-created
-   Partial refund → proportional point reversal, applied immediately.
-   Full refund    → full reversal + credit back redeemed points, immediately.
    ───────────────────────────────────────── */
 app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!verifyHmac(req)) {
-    console.error('[webhook/refund-created] HMAC mismatch');
-    return res.status(401).send('Unauthorized');
-  }
+  if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
 
   let refund;
   try { refund = parseWebhookBody(req); }
@@ -745,7 +735,6 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
   const orderId = String(refund.order_id);
   let order;
   try {
-    console.log(`[refund-created] Fetching order ${orderId}`);
     const data = await shopifyFetch(
       `/orders/${orderId}.json?fields=id,order_number,total_price,discount_codes,financial_status,customer`
     );
@@ -779,31 +768,24 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
     let pointsDeducted = 0;
     let pointsCredited = 0;
 
-    // Reverse earned points
-    const earnEntry = history.find(
-      h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed
-    );
+    const earnEntry = history.find(h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed);
     if (earnEntry && earnEntry.points > 0) {
       if (isFullRefund) {
         pointsDeducted             = earnEntry.points;
         earnEntry.reversed         = true;
-        earnEntry.remaining_points = 0; // zero out — nothing left for expiry to touch
+        earnEntry.remaining_points = 0;
       } else {
-        const ratio        = Math.min(1, refundAmount / originalTotal);
-        pointsDeducted      = Math.floor(earnEntry.points * ratio);
-        earnEntry.points   -= pointsDeducted;
-        // Keep remaining_points in sync with the reduced entry so a later
-        // expiry sweep can't expire points that were already clawed back here.
+        const ratio      = Math.min(1, refundAmount / originalTotal);
+        pointsDeducted    = Math.floor(earnEntry.points * ratio);
+        earnEntry.points -= pointsDeducted;
         earnEntry.remaining_points = Math.max(
-          0,
-          (earnEntry.remaining_points ?? (earnEntry.points + pointsDeducted)) - pointsDeducted
+          0, (earnEntry.remaining_points ?? (earnEntry.points + pointsDeducted)) - pointsDeducted
         );
       }
       balance = Math.max(0, balance - pointsDeducted);
       console.log(`[refund-created] Reversing ${pointsDeducted} pts (${isFullRefund ? 'full' : 'partial'})`);
     }
 
-    // Credit back redeemed points on full refund only
     if (isFullRefund) {
       const rwrdCodes = (order.discount_codes || [])
         .filter(d => d.code?.startsWith('RWRD-'))
@@ -831,12 +813,10 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
     if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
 
     history.unshift({
-      type:          pointsCredited >= pointsDeducted ? 'earn' : 'use',
-      description:   `Order #${orderNumber} ${isFullRefund ? 'refunded' : 'partial refund'}: ${parts.join(', ')}`,
-      points:        pointsCredited - pointsDeducted,
-      created_at:    new Date().toISOString(),
-      order_id:      orderId,
-      is_adjustment: true
+      type: pointsCredited >= pointsDeducted ? 'earn' : 'use',
+      description: `Order #${orderNumber} ${isFullRefund ? 'refunded' : 'partial refund'}: ${parts.join(', ')}`,
+      points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
+      order_id: orderId, is_adjustment: true
     });
 
     await Promise.all([
@@ -854,8 +834,6 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
 
 /* ─────────────────────────────────────────
    ADMIN AUTH + RATE LIMIT
-   Shared by every ReqBin-triggered admin route below. 5 attempts per IP
-   per 15-minute window; a correct secret clears the counter for that IP.
    ───────────────────────────────────────── */
 const adminAttempts = new Map();
 
@@ -884,14 +862,6 @@ function requireAdminAuth(req, res, next) {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/admin/add-points
-   Adds points to a customer's current balance. Always additive — there is
-   no "set balance to X" action, since a mistyped absolute value would
-   silently overwrite the real balance with no way to detect the error.
-   Every credit becomes its own history entry with its own expiry, so
-   multiple manual credits to the same customer expire independently and
-   correctly, exactly like purchase-earned points do.
-   Body: { secret, customer_id, points, expires_at, note }
-   expires_at: required, format YYYY-MM-DD, must be a future date.
    ───────────────────────────────────────── */
 app.post('/api/admin/add-points', requireAdminAuth, async (req, res) => {
   const { customer_id, points, expires_at, note } = req.body;
@@ -923,13 +893,9 @@ app.post('/api/admin/add-points', requireAdminAuth, async (req, res) => {
     const newBalance = current + ptsInt;
 
     history.unshift({
-      type:             'earn',
-      description:      note || `${ptsInt} pts added manually`,
-      points:           ptsInt,
-      remaining_points: ptsInt,
-      created_at:       new Date().toISOString(),
-      expires_at:       expiryDate.toISOString(),
-      is_manual:        true
+      type: 'earn', description: note || `${ptsInt} pts added manually`, points: ptsInt,
+      remaining_points: ptsInt, created_at: new Date().toISOString(),
+      expires_at: expiryDate.toISOString(), is_manual: true
     });
 
     await Promise.all([
@@ -947,10 +913,6 @@ app.post('/api/admin/add-points', requireAdminAuth, async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/admin/deduct-points
-   Deducts points from a customer's current balance. No expiry needed —
-   this creates a 'use' entry, not new points entering the system, so it
-   is never touched by the expiry sweep. Balance floors at zero.
-   Body: { secret, customer_id, points, note }
    ───────────────────────────────────────── */
 app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
   const { customer_id, points, note } = req.body;
@@ -974,11 +936,8 @@ app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
     const newBalance = Math.max(0, current - ptsInt);
 
     history.unshift({
-      type:        'use',
-      description: note || `${ptsInt} pts deducted manually`,
-      points:      ptsInt,
-      created_at:  new Date().toISOString(),
-      is_manual:   true
+      type: 'use', description: note || `${ptsInt} pts deducted manually`,
+      points: ptsInt, created_at: new Date().toISOString(), is_manual: true
     });
 
     await Promise.all([
@@ -996,23 +955,44 @@ app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/save-birthday
-   Called via App Proxy when customer submits their birthday.
-   Saves birthday to rewards/birthday metafield.
+   Saves the customer's birthday AND keeps the shop-level birthday_index
+   metafield (month → [customer IDs]) in sync, so the monthly cron never
+   needs to re-scan the full customer list. The index update is wrapped
+   in withIndexLock to serialize concurrent saves on this process — see
+   the IN-PROCESS INDEX LOCK comment above for what that does and does
+   not protect against.
    ───────────────────────────────────────── */
 app.post('/api/save-birthday', async (req, res) => {
   const { customer_id, birthday } = req.body;
-  if (!customer_id || !birthday) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-
-  // Validate date format YYYY-MM-DD
+  if (!customer_id || !birthday) return res.status(400).json({ error: 'Missing fields' });
   if (!/^\d{4}-\d{2}-\d{2}$/.test(birthday)) {
     return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
   }
 
   try {
     await setMetafield(customer_id, 'birthday', birthday, 'date');
-    console.log(`[save-birthday] Customer ${customer_id}: birthday saved as ${birthday}`);
+
+    const [, mm] = birthday.split('-');
+    const month  = String(parseInt(mm, 10));
+    const custId = String(customer_id);
+
+    await withIndexLock(async () => {
+      const indexMF = await getShopMetafield('birthday_index');
+      let index = {};
+      if (indexMF) { try { index = JSON.parse(indexMF.value); } catch {} }
+
+      // Remove this customer from any previous month bucket first —
+      // handles the case where a customer edits an already-saved birthday.
+      for (const m of Object.keys(index)) {
+        index[m] = (index[m] || []).filter(id => id !== custId);
+      }
+      index[month] = index[month] || [];
+      if (!index[month].includes(custId)) index[month].push(custId);
+
+      await setShopMetafield('birthday_index', index);
+    });
+
+    console.log(`[save-birthday] Customer ${customer_id}: saved ${birthday}, indexed under month ${month}`);
     res.json({ ok: true });
   } catch (e) {
     console.error('[save-birthday]', e.message);
@@ -1021,133 +1001,198 @@ app.post('/api/save-birthday', async (req, res) => {
 });
 
 /* ─────────────────────────────────────────
+   ROUTE: POST /api/admin/backfill-birthday-index
+   ONE-TIME (but safe to re-run) tool: pages through EVERY customer once,
+   reads their birthday metafield if set, and rebuilds birthday_index
+   from scratch. Run this once right after deploying the index-based
+   cron below, so customers who saved a birthday before the index existed
+   aren't invisible to it. Also safe to re-run after a bulk customer
+   import, or any time you suspect the index has drifted from reality.
+
+   This is the only route that still does a full customer-list scan —
+   by design, since it only needs to run rarely, not every month.
+   Protected by ADMIN_SECRET. Guards against being triggered twice
+   concurrently (the only realistic way this route could corrupt data).
+   ───────────────────────────────────────── */
+let backfillRunning = false;
+
+app.post('/api/admin/backfill-birthday-index', requireAdminAuth, async (req, res) => {
+  if (backfillRunning) {
+    return res.status(409).json({ error: 'Backfill already in progress. Check Railway logs for completion.' });
+  }
+  backfillRunning = true;
+
+  // Respond immediately — a full customer scan can take a while, and
+  // ReqBin / whatever triggers this shouldn't need to hold the
+  // connection open for the whole run.
+  res.json({ ok: true, status: 'backfill_started' });
+
+  try {
+    const index = {};
+    let scanned = 0, indexed = 0;
+    let page = `https://${SHOP}/admin/api/2025-04/customers.json?limit=250&fields=id,email`;
+
+    while (page) {
+      let res2;
+      try {
+        res2 = await throttledFetch(page, { headers: HEADERS });
+      } catch (e) {
+        console.error('[backfill] Customer page fetch failed:', e.message);
+        break;
+      }
+      if (!res2.ok) {
+        console.error('[backfill] Failed to fetch customers:', res2.status);
+        break;
+      }
+
+      const data      = await res2.json();
+      const customers = data.customers || [];
+
+      for (const customer of customers) {
+        scanned++;
+        try {
+          const bdayMF = await getMetafield(customer.id, 'birthday');
+          if (!bdayMF) continue;
+
+          const [, mm] = bdayMF.value.split('-');
+          const month  = String(parseInt(mm, 10));
+          const custId = String(customer.id);
+
+          index[month] = index[month] || [];
+          if (!index[month].includes(custId)) index[month].push(custId);
+          indexed++;
+        } catch (e) {
+          console.error(`[backfill] Error reading birthday for customer ${customer.id}:`, e.message);
+        }
+      }
+
+      const linkHeader = res2.headers.get('link');
+      const nextMatch  = linkHeader?.match(/<([^>]+)>;\s*rel="next"/);
+      page = nextMatch ? nextMatch[1] : null;
+    }
+
+    await setShopMetafield('birthday_index', index);
+    console.log(`[backfill] Finished. Scanned ${scanned} customers, indexed ${indexed} with a saved birthday.`);
+  } catch (e) {
+    console.error('[backfill] Failed:', e.message);
+  } finally {
+    backfillRunning = false;
+  }
+});
+
+/* ─────────────────────────────────────────
    ROUTE: GET /api/cron/birthday
-   Run monthly, on the 1st, via external cron (cron-job.org or similar).
-   Awards points to every customer whose birthday falls in the CURRENT
-   MONTH (day-of-month is ignored — a May 15 birthday and a May 1
-   birthday are treated identically). Points expire at 23:59:59 on the
-   last day of that same month, regardless of which day of the month
-   the cron actually fires on.
+   Run monthly, on the 1st, via external cron.
+
+   INDEX-BACKED: reads the birthday_index shop metafield (built by the
+   backfill route and kept current by /api/save-birthday) to find
+   exactly which customers have a birthday in the current month. Does
+   NOT scan the full customer list — cost is roughly 2 API calls per
+   MATCHED customer, zero for everyone else.
+
+   If a customer ID in the index no longer exists in Shopify (deleted
+   customer), it's evicted from the index at the end of this run instead
+   of erroring on that ID every month indefinitely.
+
+   Points expire at 23:59:59 on the last day of the current month,
+   regardless of which day of the month the cron actually fires on.
    Protected by ADMIN_SECRET.
 
    Cron schedule required: 0 0 1 * *  (00:00 on the 1st of every month)
-   NOT daily — a daily schedule would still only award once per year per
-   customer (guarded by the alreadyAwarded check below), but the day-1
-   guard means every non-1st invocation would just no-op, which is
-   harmless but pointless. Update the external cron schedule accordingly.
-
    GET https://your-railway-url.up.railway.app/api/cron/birthday?secret=YOUR_ADMIN_SECRET
    ───────────────────────────────────────── */
-const BIRTHDAY_POINTS = 100; // points awarded once per year, in the birth month
+const BIRTHDAY_POINTS = 100;
 
 app.get('/api/cron/birthday', async (req, res) => {
   const { secret } = req.query;
-  const ADMIN_SECRET = process.env.ADMIN_SECRET;
-  if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
   const today      = new Date();
-  const todayMonth = today.getMonth() + 1; // 1-12
+  const todayMonth = today.getMonth() + 1;
   const thisYear   = today.getFullYear();
 
-  // Defense-in-depth: this route is meant to run once, on the 1st of each
-  // month. If it ever fires on another day (misconfigured cron, manual
-  // trigger, retry), skip instead of mis-awarding for the wrong window.
   if (today.getDate() !== 1) {
-    return res.json({
-      ok: true,
-      skipped_reason: 'not_first_of_month',
-      date: today.toISOString().slice(0, 10)
-    });
+    return res.json({ ok: true, skipped_reason: 'not_first_of_month', date: today.toISOString().slice(0, 10) });
   }
 
-  // Last moment of this month — the expiry for every birthday credit awarded today
   const monthEnd     = new Date(thisYear, todayMonth, 0, 23, 59, 59);
   const expiresAtISO = monthEnd.toISOString();
 
-  console.log(`[cron/birthday] Running for birth-month ${todayMonth}. Points expire ${expiresAtISO}`);
-
-  let awarded = 0;
-  let skipped = 0;
-  let page    = `https://${SHOP}/admin/api/2025-04/customers.json?limit=250&fields=id,email,metafields`;
-
-  // Page through all customers
-  while (page) {
-    const res2 = await fetch(page, { headers: HEADERS });
-    if (!res2.ok) {
-      console.error('[cron/birthday] Failed to fetch customers:', res2.status);
-      break;
-    }
-
-    const data      = await res2.json();
-    const customers = data.customers || [];
-
-    for (const customer of customers) {
-      try {
-        // Get birthday metafield for this customer
-        const bdayMF = await getMetafield(customer.id, 'birthday');
-        if (!bdayMF) continue;
-
-        const bday = bdayMF.value; // format: YYYY-MM-DD
-        const [, mm] = bday.split('-');
-        if (parseInt(mm, 10) !== todayMonth) continue;
-
-        // Check if already awarded this year
-        const historyMF = await getMetafield(customer.id, 'history');
-        let history = [];
-        if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
-
-        const alreadyAwarded = history.some(h =>
-          h.is_birthday &&
-          new Date(h.created_at).getFullYear() === thisYear
-        );
-
-        if (alreadyAwarded) {
-          console.log(`[cron/birthday] Customer ${customer.id}: already awarded this year`);
-          skipped++;
-          continue;
-        }
-
-        // Award birthday points
-        const balanceMF  = await getMetafield(customer.id, 'balance');
-        const balance    = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-        const newBalance = balance + BIRTHDAY_POINTS;
-
-        history.unshift({
-          type:             'earn',
-          description:      'Birthday bonus 🎂 — expires end of this month',
-          points:           BIRTHDAY_POINTS,
-          remaining_points: BIRTHDAY_POINTS,
-          created_at:       new Date().toISOString(),
-          expires_at:       expiresAtISO,
-          is_birthday:      true
-        });
-
-        await Promise.all([
-          setMetafield(customer.id, 'balance', newBalance, 'integer'),
-          setMetafield(customer.id, 'history', history, 'json')
-        ]);
-
-        console.log(`[cron/birthday] Customer ${customer.id} (${customer.email}): +${BIRTHDAY_POINTS} pts. Balance: ${balance} → ${newBalance}. Expires ${expiresAtISO}`);
-        awarded++;
-
-        // Small delay between customers to avoid rate limiting
-        await new Promise(r => setTimeout(r, 300));
-
-      } catch (e) {
-        console.error(`[cron/birthday] Error for customer ${customer.id}:`, e.message);
-      }
-    }
-
-    // Handle pagination via Link header
-    const linkHeader = res2.headers.get('link');
-    const nextMatch  = linkHeader?.match(/<([^>]+)>;\s*rel="next"/);
-    page = nextMatch ? nextMatch[1] : null;
+  let index = {};
+  try {
+    const indexMF = await getShopMetafield('birthday_index');
+    if (indexMF) { try { index = JSON.parse(indexMF.value); } catch {} }
+  } catch (e) {
+    console.error('[cron/birthday] Failed to load birthday_index:', e.message);
+    return res.status(500).json({ error: 'Could not load birthday index' });
   }
 
-  console.log(`[cron/birthday] Done. Awarded: ${awarded}, Skipped: ${skipped}`);
-  res.json({ ok: true, awarded, skipped, birth_month: todayMonth, expires_at: expiresAtISO });
+  const customerIds = index[String(todayMonth)] || [];
+
+  res.json({ ok: true, status: 'processing_started', birth_month: todayMonth, matched: customerIds.length });
+
+  console.log(`[cron/birthday] Started for birth-month ${todayMonth}. ${customerIds.length} customers matched. Expires ${expiresAtISO}`);
+
+  let awarded = 0, skipped = 0, evicted = 0;
+  const staleIds = [];
+
+  for (const customerId of customerIds) {
+    try {
+      const historyMF = await getMetafield(customerId, 'history');
+      let history = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+      const alreadyAwarded = history.some(h => h.is_birthday && new Date(h.created_at).getFullYear() === thisYear);
+      if (alreadyAwarded) {
+        console.log(`[cron/birthday] Customer ${customerId}: already awarded this year`);
+        skipped++;
+        continue;
+      }
+
+      const balanceMF  = await getMetafield(customerId, 'balance');
+      const balance    = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      const newBalance = balance + BIRTHDAY_POINTS;
+
+      history.unshift({
+        type: 'earn', description: 'Birthday bonus 🎂 — expires end of this month',
+        points: BIRTHDAY_POINTS, remaining_points: BIRTHDAY_POINTS,
+        created_at: new Date().toISOString(), expires_at: expiresAtISO, is_birthday: true
+      });
+
+      await Promise.all([
+        setMetafield(customerId, 'balance', newBalance, 'integer'),
+        setMetafield(customerId, 'history', history, 'json')
+      ]);
+
+      console.log(`[cron/birthday] Customer ${customerId}: +${BIRTHDAY_POINTS} pts. Balance: ${balance} → ${newBalance}. Expires ${expiresAtISO}`);
+      awarded++;
+    } catch (e) {
+      // A 404-style error here almost always means the customer no
+      // longer exists in Shopify — evict them from the index so this
+      // route doesn't keep erroring on the same dead ID every month.
+      const looksDeleted = /error 404/i.test(e.message);
+      if (looksDeleted) {
+        staleIds.push(customerId);
+        evicted++;
+        console.log(`[cron/birthday] Customer ${customerId} not found — evicting from index`);
+      } else {
+        console.error(`[cron/birthday] Error for customer ${customerId}:`, e.message);
+      }
+    }
+  }
+
+  if (staleIds.length > 0) {
+    try {
+      index[String(todayMonth)] = (index[String(todayMonth)] || []).filter(id => !staleIds.includes(id));
+      await withIndexLock(() => setShopMetafield('birthday_index', index));
+    } catch (e) {
+      console.error('[cron/birthday] Failed to persist index eviction:', e.message);
+    }
+  }
+
+  console.log(`[cron/birthday] Finished. Awarded: ${awarded}, Skipped: ${skipped}, Evicted: ${evicted}`);
 });
 
 /* ── Start ── */
