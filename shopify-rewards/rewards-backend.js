@@ -11,37 +11,49 @@
  *   Orders using this coupon earn 100% of amount paid (after discount) as points.
  *   All other orders earn 1% of amount paid (after discount).
  *
- * Points expiry: every earn-type credit (purchase, welcome, birthday, manual)
- *   carries its own expires_at and expires independently, 6 months after credit
- *   by default. Manual credits require an explicit expires_at.
+ * POINTS INVARIANT: balance == sum of remaining_points across every live
+ *   (not expired, not reversed) earn entry. Every operation that changes
+ *   balance must change remaining_points by the same amount, on the same
+ *   side, or this invariant breaks and expiry starts double-counting
+ *   already-spent points. Specifically:
+ *     - Earning (welcome/order-paid/birthday/admin-add): new entry created
+ *       with remaining_points == points. Balance and remaining_points rise
+ *       together — invariant holds automatically.
+ *     - Spending (apply/update-apply/admin-deduct): consumeFIFO() draws the
+ *       spent amount down from live earn entries, soonest-expiring first,
+ *       and records exactly which entries + amounts on the spending 'use'
+ *       entry's consumed_from field.
+ *     - Restoring (restore/update-apply's old-code path/the two abandoned-
+ *       checkout sweeps/order-cancelled/refund-created credit-back):
+ *       restoreFIFO() reverses a consumed_from ledger, crediting the exact
+ *       origin entries back up (capped at their original points). If an
+ *       origin entry has since expired, that portion becomes a new
+ *       non-expiring adjustment entry instead, since it can no longer be
+ *       cleanly reattached to an expired window.
+ *     - Expiry (processExpiry): already reads remaining_points per entry;
+ *       now that spends correctly decrement it, expiry stops over-counting.
+ *
+ *   CAVEAT: entries created before this fix deployed have no consumed_from
+ *   history — any redemption that already happened against them isn't
+ *   reflected in their remaining_points. This fix prevents the problem
+ *   going forward; it does not retroactively correct existing data.
+ *
+ * Points expiry: every earn-type credit carries its own expires_at and
+ *   expires independently, 6 months after credit by default. Manual
+ *   credits require an explicit expires_at.
  *
  * Birthday points — INDEX-BACKED: see rewards/birthday_index shop metafield.
  *   Backfill once via /api/admin/backfill-birthday-index, then the monthly
  *   cron reads only the index — never the full customer list.
  *
  * Stale applied-points recovery — TWO LAYERS:
- *   1. PROACTIVE: an in-memory registry (pendingApplies) tracks every code
- *      created by /api/apply or /api/update-apply. A setInterval sweep
- *      checks it every SWEEP_INTERVAL_MS and resolves anything past
- *      STALE_APPLY_MS — restoring points if the code was never used, leaving
- *      it alone if it was. This registry lives in memory only: a server
- *      restart clears it.
- *   2. FALLBACK (always active, regardless of #1): GET /api/points — called
- *      on every cart-page load — runs the same stale-check against the
- *      customer's actual history. So even if the in-memory registry is lost
- *      to a restart, nothing is silently stuck forever; it's caught on that
- *      customer's next cart visit at the latest.
- *
- *   CORRECTNESS-CRITICAL: order-paid marks the matching 'use' history entry
- *   with confirmed:true at the exact moment it deletes that code. Both
- *   layers above skip any entry with confirmed:true BEFORE ever asking
- *   Shopify anything. This exists because once a code is deleted for having
- *   been legitimately used, a later Shopify lookup for it returns "not
- *   found" — indistinguishable, by API response alone, from "never existed
- *   because it was abandoned." Without the confirmed flag as ground truth,
- *   a slow-but-genuine checkout (order completes >30 min after points were
- *   applied) would have its points wrongly restored on top of the purchase
- *   already having spent them.
+ *   1. PROACTIVE: an in-memory registry (pendingApplies), swept every
+ *      SWEEP_INTERVAL_MS, resolving anything past STALE_APPLY_MS. In-memory
+ *      only — a restart clears it.
+ *   2. FALLBACK: GET /api/points runs the same stale-check on every
+ *      cart-page load, regardless of what the in-memory registry knows.
+ *   Both skip any entry with confirmed:true — see order-paid below for why
+ *   that flag exists and is load-bearing.
  *
  * Rate limiting: every outbound Shopify call is serialized through a single
  *   throttled queue (~1.8 req/sec) with automatic 429 retry.
@@ -67,12 +79,8 @@ const SECRET       = process.env.SHOPIFY_API_SECRET;
 const BONUS_COUPON         = 'FREE50';
 const POINTS_EXPIRY_MONTHS = 6;
 
-// How long an applied-but-unused RWRD- code is given before it's treated as
-// abandoned. Used by /api/apply's reuse check, the fallback sweep in
-// GET /api/points, and the proactive periodic sweep below — one constant,
-// so all three can't drift apart. Keep rewards-panel.js's STALE_MS in sync.
-const STALE_APPLY_MS   = 30 * 60 * 1000; // 30 minutes
-const SWEEP_INTERVAL_MS = 2 * 60 * 1000; // how often the proactive sweep runs
+const STALE_APPLY_MS    = 30 * 60 * 1000; // 30 minutes — keep in sync with rewards-panel.js's STALE_MS
+const SWEEP_INTERVAL_MS = 2 * 60 * 1000;
 
 const HEADERS = {
   'X-Shopify-Access-Token': TOKEN,
@@ -82,7 +90,7 @@ const HEADERS = {
 /* ─────────────────────────────────────────
    RATE LIMITER
    ───────────────────────────────────────── */
-const MIN_INTERVAL_MS = 550; // ≈1.8 req/sec, under Shopify's 2/sec ceiling
+const MIN_INTERVAL_MS = 550;
 const MAX_RETRIES     = 5;
 
 let requestQueue = Promise.resolve();
@@ -165,7 +173,7 @@ async function setMetafield(customerId, key, value, type = 'integer') {
 }
 
 /* ─────────────────────────────────────────
-   HELPERS — shop-level metafields (used for the birthday index)
+   HELPERS — shop-level metafields (birthday index)
    ───────────────────────────────────────── */
 
 async function getShopMetafield(key) {
@@ -187,8 +195,6 @@ async function setShopMetafield(key, value) {
 
 /* ─────────────────────────────────────────
    IN-PROCESS INDEX LOCK (birthday_index)
-   Serializes concurrent birthday_index read-modify-writes on this single
-   process. Does not protect against multiple horizontally-scaled instances.
    ───────────────────────────────────────── */
 let indexQueue = Promise.resolve();
 
@@ -210,14 +216,89 @@ function parseWebhookBody(req) {
 }
 
 /* ─────────────────────────────────────────
+   ENTRY IDS + FIFO CONSUMPTION LEDGER
+   Every history entry gets a stable id, generated once at creation, so a
+   spend can reference exactly which earn entries it drew from — and a
+   later restore can reverse exactly that, rather than guessing.
+   ───────────────────────────────────────── */
+function generateEntryId() {
+  return crypto.randomBytes(6).toString('hex');
+}
+
+// Live (spendable) earn entries, soonest-expiring first. Entries with no
+// expires_at (permanent adjustment credits) sort last, since there's no
+// urgency to draw them down before something that could actually expire.
+function getLiveEarnEntriesSorted(history) {
+  return history
+    .filter(h => h.type === 'earn' && !h.expired && !h.reversed && (h.remaining_points ?? h.points) > 0)
+    .sort((a, b) => {
+      const aExp = a.expires_at ? new Date(a.expires_at).getTime() : Infinity;
+      const bExp = b.expires_at ? new Date(b.expires_at).getTime() : Infinity;
+      return aExp - bExp;
+    });
+}
+
+// Draws `amount` points from live earn entries via FIFO-by-soonest-expiry,
+// mutating remaining_points in place. Returns the ledger to attach to the
+// spending 'use' entry's consumed_from field.
+function consumeFIFO(history, amount) {
+  const entries = getLiveEarnEntriesSorted(history);
+  let remaining = amount;
+  const consumedFrom = [];
+
+  for (const entry of entries) {
+    if (remaining <= 0) break;
+    const available = entry.remaining_points ?? entry.points;
+    const take = Math.min(available, remaining);
+    if (take <= 0) continue;
+    entry.remaining_points = available - take;
+    consumedFrom.push({ id: entry.id, amount: take });
+    remaining -= take;
+  }
+
+  if (remaining > 0) {
+    console.warn(`[consumeFIFO] Could not attribute ${remaining}pts to any live earn entry — balance/remaining_points may be out of sync (likely pre-fix history).`);
+  }
+
+  return consumedFrom;
+}
+
+// Reverses a consumed_from ledger, crediting origin entries back up
+// (capped at their original points). If an origin entry has already
+// expired, that share becomes a new non-expiring adjustment entry instead
+// — it can't be cleanly reattached to a window that's already closed.
+function restoreFIFO(history, consumedFrom) {
+  if (!consumedFrom || consumedFrom.length === 0) return;
+  let orphaned = 0;
+
+  for (const { id, amount } of consumedFrom) {
+    const entry = history.find(h => h.id === id);
+    if (entry && !entry.expired) {
+      entry.remaining_points = Math.min(entry.points, (entry.remaining_points ?? 0) + amount);
+    } else {
+      orphaned += amount;
+    }
+  }
+
+  if (orphaned > 0) {
+    history.unshift({
+      type: 'earn',
+      id: generateEntryId(),
+      description: `${orphaned} pts restored (original earn entry already expired)`,
+      points: orphaned,
+      remaining_points: orphaned,
+      created_at: new Date().toISOString(),
+      is_restoration_adjustment: true
+      // deliberately no expires_at — can't reattach to the original
+      // window, so this portion no longer expires.
+    });
+  }
+}
+
+/* ─────────────────────────────────────────
    SHARED CODE LOOKUP + CLEANUP
-   One Shopify lookup, used by every path that needs to know "was this
-   RWRD- code ever used, and is it gone yet." usage_limit on every RWRD-
-   price rule is always 1, so once a code is found at all, it can never be
-   used again regardless of its current usage_count — safe to delete
-   unconditionally whenever this function finds it, whether it was spent
-   (usage_count 1) or abandoned (usage_count 0). Only the CALLER decides
-   whether usage_count 0 means "restore points."
+   usage_limit is always 1 on RWRD- price rules, so once found, a code can
+   never be used again either way — safe to delete unconditionally.
    ───────────────────────────────────────── */
 async function lookupAndCleanupCode(discountCode) {
   const lookup = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(discountCode)}`);
@@ -234,8 +315,6 @@ async function lookupAndCleanupCode(discountCode) {
   return { usageCount, existed: true };
 }
 
-// Kept as a thin wrapper for the two call sites (order-paid, order-cancelled)
-// that just want "delete this and don't care about usage_count."
 async function deleteRwrdCode(code) {
   try {
     await lookupAndCleanupCode(code);
@@ -246,12 +325,6 @@ async function deleteRwrdCode(code) {
 
 /* ─────────────────────────────────────────
    PROACTIVE SWEEP REGISTRY
-   customerId (string) -> Map<discountCode, appliedAtMs>
-   Populated by /api/apply and /api/update-apply. Entries are removed as
-   soon as they're resolved (restored, confirmed-used, or manually
-   restored via /api/restore) so the periodic sweep never re-checks a
-   code twice. In-memory only — see file header comment for what that
-   does and does not mean for reliability.
    ───────────────────────────────────────── */
 const pendingApplies = new Map();
 
@@ -301,7 +374,7 @@ async function processExpiry(customerId, balance, history) {
   if (expiredPoints > 0) {
     const newBalance = Math.max(0, balance - expiredPoints);
     history.unshift({
-      type: 'use', description: `${expiredPoints} pts expired (6-month expiry)`,
+      type: 'use', id: generateEntryId(), description: `${expiredPoints} pts expired (6-month expiry)`,
       points: expiredPoints, created_at: new Date().toISOString(), is_expiry: true
     });
 
@@ -319,10 +392,6 @@ async function processExpiry(customerId, balance, history) {
 
 /* ─────────────────────────────────────────
    STALE APPLIED-POINTS RECOVERY — FALLBACK LAYER
-   Runs inside GET /api/points, unconditionally, regardless of whether the
-   proactive sweep already handled (or ever knew about) a given code.
-   Skips any entry with confirmed:true — see file header for why that flag
-   is load-bearing here.
    ───────────────────────────────────────── */
 async function restoreStaleAppliedCodes(customerId, balance, history) {
   const now = Date.now();
@@ -340,6 +409,7 @@ async function restoreStaleAppliedCodes(customerId, balance, history) {
     try {
       const { usageCount } = await lookupAndCleanupCode(entry.discount_code);
       if (usageCount === 0) {
+        restoreFIFO(history, entry.consumed_from);
         balance += entry.points;
         history  = history.filter(h => h !== entry);
         changed  = true;
@@ -355,10 +425,7 @@ async function restoreStaleAppliedCodes(customerId, balance, history) {
 }
 
 /* ─────────────────────────────────────────
-   PROACTIVE SWEEP — runs every SWEEP_INTERVAL_MS
-   Checks the in-memory registry rather than every customer's full history,
-   so this stays cheap regardless of store size. Skips entries whose
-   history entry is confirmed:true, same as the fallback layer.
+   PROACTIVE SWEEP
    ───────────────────────────────────────── */
 async function sweepPendingApplies() {
   const now = Date.now();
@@ -375,8 +442,6 @@ async function sweepPendingApplies() {
         const entry = history.find(h => h.type === 'use' && h.discount_code === discountCode && !h.refunded);
 
         if (!entry || entry.confirmed) {
-          // Already resolved some other way (manual restore, order-paid
-          // confirmation) — just stop tracking it.
           unregisterPendingApply(customerId, discountCode);
           continue;
         }
@@ -386,6 +451,8 @@ async function sweepPendingApplies() {
         if (usageCount === 0) {
           const balanceMF = await getMetafield(customerId, 'balance');
           const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+
+          restoreFIFO(history, entry.consumed_from);
           const newBalance = balance + entry.points;
           const newHistory = history.filter(h => h !== entry);
 
@@ -400,8 +467,6 @@ async function sweepPendingApplies() {
         unregisterPendingApply(customerId, discountCode);
       } catch (e) {
         console.error(`[auto-restore-sweep] Error resolving ${discountCode} for customer ${customerId}:`, e.message);
-        // Leave it registered — retry on the next tick rather than losing
-        // track of it after a single transient failure.
       }
     }
   }
@@ -475,7 +540,8 @@ app.get('/api/check-code', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/apply
-   Registers the new code with the proactive sweep on success.
+   Draws the spent amount via FIFO, tags the use entry with exactly which
+   earn entries it came from.
    ───────────────────────────────────────── */
 app.post('/api/apply', async (req, res) => {
   const { customer_id, points_to_use, cart_total } = req.body;
@@ -528,9 +594,11 @@ app.post('/api/apply', async (req, res) => {
       method: 'POST', body: JSON.stringify({ discount_code: { code } })
     });
 
+    const consumedFrom = consumeFIFO(history, ptsInt);
+
     history.unshift({
-      type: 'use', description: `${ptsInt} points redeemed`, points: ptsInt,
-      discount_code: code, created_at: new Date().toISOString()
+      type: 'use', id: generateEntryId(), description: `${ptsInt} points redeemed`, points: ptsInt,
+      discount_code: code, created_at: new Date().toISOString(), consumed_from: consumedFrom
     });
 
     await Promise.all([
@@ -549,8 +617,8 @@ app.post('/api/apply', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/update-apply
-   Deregisters the old code (already resolved inline below), registers
-   the new one with the proactive sweep.
+   Reverses the OLD spend's consumed_from (if unused) before drawing a NEW
+   consumed_from for the updated amount.
    ───────────────────────────────────────── */
 app.post('/api/update-apply', async (req, res) => {
   const { customer_id, old_points, old_discount_code, new_points, cart_total } = req.body;
@@ -584,7 +652,10 @@ app.post('/api/update-apply', async (req, res) => {
     let history     = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
+    const oldEntry = history.find(h => h.type === 'use' && h.discount_code === old_discount_code);
+
     if (!oldCodeWasUsed) {
+      if (oldEntry) restoreFIFO(history, oldEntry.consumed_from);
       balance = balance + oldPts;
       history = history.filter(h => !(h.type === 'use' && h.discount_code === old_discount_code));
       console.log(`[update-apply] Old code unused — restored ${oldPts}pts`);
@@ -613,9 +684,11 @@ app.post('/api/update-apply', async (req, res) => {
       method: 'POST', body: JSON.stringify({ discount_code: { code } })
     });
 
+    const consumedFrom = consumeFIFO(history, newPts);
+
     history.unshift({
-      type: 'use', description: `${newPts} points redeemed`, points: newPts,
-      discount_code: code, created_at: new Date().toISOString()
+      type: 'use', id: generateEntryId(), description: `${newPts} points redeemed`, points: newPts,
+      discount_code: code, created_at: new Date().toISOString(), consumed_from: consumedFrom
     });
 
     await Promise.all([
@@ -634,8 +707,6 @@ app.post('/api/update-apply', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/restore
-   Customer-initiated instant restore. Deregisters from the proactive
-   sweep since it's already resolved.
    ───────────────────────────────────────── */
 app.post('/api/restore', async (req, res) => {
   const { customer_id, points, discount_code } = req.body;
@@ -660,7 +731,12 @@ app.post('/api/restore', async (req, res) => {
     let history     = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
+    const useEntry = discount_code
+      ? history.find(h => h.type === 'use' && h.discount_code === discount_code)
+      : null;
+
     if (!codeWasUsed) {
+      if (useEntry) restoreFIFO(history, useEntry.consumed_from);
       history = history.filter(h => !(h.type === 'use' && h.discount_code === discount_code));
       await Promise.all([
         setMetafield(customer_id, 'balance', balance + pts, 'integer'),
@@ -705,7 +781,7 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
     expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
 
     const history = [{
-      type: 'earn', description: 'Welcome bonus', points: WELCOME_POINTS,
+      type: 'earn', id: generateEntryId(), description: 'Welcome bonus', points: WELCOME_POINTS,
       remaining_points: WELCOME_POINTS, created_at: new Date().toISOString(),
       expires_at: expiresAt.toISOString(), is_welcome: true
     }];
@@ -725,8 +801,6 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-paid
-   Marks the matching 'use' entry confirmed:true at the exact moment its
-   code is deleted — see file header for why this is load-bearing.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
@@ -762,17 +836,13 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
     expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
 
     history.unshift({
-      type: 'earn',
+      type: 'earn', id: generateEntryId(),
       description: `Order #${order.order_number} — ${earnedPoints} pts earned${usedBonusCoupon ? ' (100% bonus)' : ''}`,
       points: earnedPoints, remaining_points: earnedPoints,
       created_at: new Date().toISOString(), expires_at: expiresAt.toISOString(),
       order_id: String(orderId)
     });
 
-    // Mark any RWRD- redemption used in THIS order as confirmed, in the
-    // same read-modify-write as the earn entry above — before the code
-    // gets deleted a few lines down, so there's no window where the code
-    // is gone but the entry doesn't yet say why.
     const rwrdCodes = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
     for (const d of rwrdCodes) {
       const useEntry = history.find(h => h.type === 'use' && h.discount_code === d.code && !h.refunded);
@@ -801,10 +871,6 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-cancelled
-   Note: confirmed:true entries ARE still eligible to be touched here —
-   that flag only gates the stale-abandonment sweeps above. A genuine
-   cancellation of a completed order is exactly what this webhook exists
-   to handle, confirmed or not.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
@@ -846,6 +912,7 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
       const refundPts = rwrdCodes.reduce((sum, a) => sum + a, 0);
       const useEntry  = history.find(h => h.type === 'use' && h.points === refundPts && !h.refunded);
       if (useEntry) {
+        restoreFIFO(history, useEntry.consumed_from);
         pointsCredited    = refundPts;
         useEntry.refunded = true;
         balance          += pointsCredited;
@@ -863,7 +930,7 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
     if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
 
     history.unshift({
-      type: pointsCredited >= pointsDeducted ? 'earn' : 'use',
+      type: pointsCredited >= pointsDeducted ? 'earn' : 'use', id: generateEntryId(),
       description: `Order #${orderNumber} cancelled: ${parts.join(', ')}`,
       points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
       order_id: orderId, is_adjustment: true
@@ -891,6 +958,16 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/refund-created
+   Known residual edge case, flagged not fixed: the partial-refund branch
+   below claws back a share of the ORIGINAL earn entry based on refund
+   ratio, independent of whether some of that entry's points were already
+   spent elsewhere via FIFO consumption. If a customer redeems from this
+   entry, then this SAME order later gets partially refunded, the clawback
+   math and the FIFO-consumed remainder can both compete for the same
+   entry's remaining_points. balance is always adjusted correctly either
+   way; the entry-level attribution in that specific overlap can be
+   imprecise. Rare in practice — requires redemption from an entry before
+   a later partial refund of that entry's own originating order.
    ───────────────────────────────────────── */
 app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
@@ -962,6 +1039,7 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
         const refundPts = rwrdCodes.reduce((sum, a) => sum + a, 0);
         const useEntry  = history.find(h => h.type === 'use' && h.points === refundPts && !h.refunded);
         if (useEntry) {
+          restoreFIFO(history, useEntry.consumed_from);
           pointsCredited    = refundPts;
           useEntry.refunded = true;
           balance          += pointsCredited;
@@ -980,7 +1058,7 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
     if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
 
     history.unshift({
-      type: pointsCredited >= pointsDeducted ? 'earn' : 'use',
+      type: pointsCredited >= pointsDeducted ? 'earn' : 'use', id: generateEntryId(),
       description: `Order #${orderNumber} ${isFullRefund ? 'refunded' : 'partial refund'}: ${parts.join(', ')}`,
       points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
       order_id: orderId, is_adjustment: true
@@ -1060,7 +1138,7 @@ app.post('/api/admin/add-points', requireAdminAuth, async (req, res) => {
     const newBalance = current + ptsInt;
 
     history.unshift({
-      type: 'earn', description: note || `${ptsInt} pts added manually`, points: ptsInt,
+      type: 'earn', id: generateEntryId(), description: note || `${ptsInt} pts added manually`, points: ptsInt,
       remaining_points: ptsInt, created_at: new Date().toISOString(),
       expires_at: expiryDate.toISOString(), is_manual: true
     });
@@ -1080,6 +1158,9 @@ app.post('/api/admin/add-points', requireAdminAuth, async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/admin/deduct-points
+   Draws the deducted amount via FIFO too, keeping the invariant intact
+   even though this deduction was never tied to a discount code and will
+   never itself be automatically restored.
    ───────────────────────────────────────── */
 app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
   const { customer_id, points, note } = req.body;
@@ -1101,10 +1182,11 @@ app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
     const newBalance = Math.max(0, current - ptsInt);
+    const consumedFrom = consumeFIFO(history, ptsInt);
 
     history.unshift({
-      type: 'use', description: note || `${ptsInt} pts deducted manually`,
-      points: ptsInt, created_at: new Date().toISOString(), is_manual: true
+      type: 'use', id: generateEntryId(), description: note || `${ptsInt} pts deducted manually`,
+      points: ptsInt, created_at: new Date().toISOString(), is_manual: true, consumed_from: consumedFrom
     });
 
     await Promise.all([
@@ -1283,7 +1365,7 @@ app.get('/api/cron/birthday', async (req, res) => {
       const newBalance = balance + BIRTHDAY_POINTS;
 
       history.unshift({
-        type: 'earn', description: 'Birthday bonus 🎂 — expires end of this month',
+        type: 'earn', id: generateEntryId(), description: 'Birthday bonus 🎂 — expires end of this month',
         points: BIRTHDAY_POINTS, remaining_points: BIRTHDAY_POINTS,
         created_at: new Date().toISOString(), expires_at: expiresAtISO, is_birthday: true
       });
