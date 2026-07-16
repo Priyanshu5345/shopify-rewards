@@ -324,6 +324,26 @@ async function deleteRwrdCode(code) {
 }
 
 /* ─────────────────────────────────────────
+   PER-ORDER PROCESSING LOCK
+   Shopify can and does redeliver webhooks (slow response, retry after
+   failure, or genuine duplicate delivery). This serializes order-paid
+   processing per order_id so two near-simultaneous deliveries for the
+   SAME order can't both read history before either has written — closing
+   the race version of the duplicate-credit bug, not just the sequential
+   version (which the order_id idempotency check below already covers on
+   its own for deliveries spaced apart in time).
+   ───────────────────────────────────────── */
+const orderLocks = new Map();
+
+function withOrderLock(orderId, fn) {
+  const key  = String(orderId);
+  const prev = orderLocks.get(key) || Promise.resolve();
+  const run  = prev.then(fn);
+  orderLocks.set(key, run.catch(() => {}));
+  return run;
+}
+
+/* ─────────────────────────────────────────
    PROACTIVE SWEEP REGISTRY
    ───────────────────────────────────────── */
 const pendingApplies = new Map();
@@ -638,14 +658,6 @@ app.post('/api/update-apply', async (req, res) => {
   }
 
   try {
-    let oldCodeWasUsed = false;
-    try {
-      const { usageCount } = await lookupAndCleanupCode(old_discount_code);
-      oldCodeWasUsed = usageCount > 0;
-    } catch (e) {
-      console.log(`[update-apply] Old code lookup failed: ${e.message}`);
-    }
-
     const balanceMF = await getMetafield(customer_id, 'balance');
     let balance     = balanceMF ? parseInt(balanceMF.value, 10) : 0;
     const historyMF = await getMetafield(customer_id, 'history');
@@ -653,6 +665,27 @@ app.post('/api/update-apply', async (req, res) => {
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
     const oldEntry = history.find(h => h.type === 'use' && h.discount_code === old_discount_code);
+
+    // Same ground-truth-first check as /api/restore — never restore a
+    // code order-paid already confirmed as legitimately used.
+    if (oldEntry?.confirmed) {
+      return res.status(409).json({ error: 'This redemption was already used in a completed order and cannot be modified.' });
+    }
+    if (oldEntry?.refunded) {
+      return res.status(409).json({ error: 'This redemption was already refunded and cannot be modified.' });
+    }
+
+    let oldCodeWasUsed;
+    try {
+      const { usageCount } = await lookupAndCleanupCode(old_discount_code);
+      oldCodeWasUsed = usageCount > 0;
+    } catch (e) {
+      // FAIL-SAFE: same reasoning as /api/restore — an unverifiable old
+      // code must not default to "safe to restore." Refuse the whole
+      // update rather than risk wrongly crediting points back.
+      console.log(`[update-apply] Old code lookup failed for ${old_discount_code}: ${e.message} — refusing to proceed`);
+      return res.status(409).json({ error: 'Could not verify old code status — please reload and try again.' });
+    }
 
     if (!oldCodeWasUsed) {
       if (oldEntry) restoreFIFO(history, oldEntry.consumed_from);
@@ -715,16 +748,6 @@ app.post('/api/restore', async (req, res) => {
   const pts = parseInt(points, 10);
 
   try {
-    let codeWasUsed = false;
-    if (discount_code) {
-      try {
-        const { usageCount } = await lookupAndCleanupCode(discount_code);
-        codeWasUsed = usageCount > 0;
-      } catch (e) {
-        console.log(`[restore] Code lookup failed: ${e.message}`);
-      }
-    }
-
     const balanceMF = await getMetafield(customer_id, 'balance');
     const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
     const historyMF = await getMetafield(customer_id, 'history');
@@ -734,6 +757,40 @@ app.post('/api/restore', async (req, res) => {
     const useEntry = discount_code
       ? history.find(h => h.type === 'use' && h.discount_code === discount_code)
       : null;
+
+    // Ground truth from our own webhook beats an ambiguous Shopify lookup.
+    // If order-paid already confirmed this code was legitimately used,
+    // never restore it — regardless of what a lookup says, or whether a
+    // lookup even succeeds.
+    if (useEntry?.confirmed) {
+      console.log(`[restore] Code ${discount_code} already confirmed used in order ${useEntry.redeemed_in_order} — refusing to restore`);
+      return res.json({ ok: true, restored: false, reason: 'already_confirmed_used' });
+    }
+    if (useEntry?.refunded) {
+      console.log(`[restore] Code ${discount_code} already refunded — refusing to restore again`);
+      return res.json({ ok: true, restored: false, reason: 'already_refunded' });
+    }
+
+    let codeWasUsed = false;
+    if (discount_code) {
+      try {
+        const { usageCount } = await lookupAndCleanupCode(discount_code);
+        codeWasUsed = usageCount > 0;
+      } catch (e) {
+        // FAIL-SAFE: a lookup failure — including a 404, which is what
+        // Shopify returns for a code that's ALREADY BEEN DELETED, whether
+        // that's because it was legitimately used or because it was
+        // already restored once — must NOT default to "safe to restore."
+        // This is the exact bug that let one abandoned-code lookup
+        // failure turn into a repeated wrongful restore on every retry.
+        // Refuse and surface it for manual review instead of guessing.
+        console.log(`[restore] Code lookup failed for ${discount_code}: ${e.message} — refusing to restore automatically`);
+        return res.status(409).json({
+          ok: false,
+          error: 'Could not verify code status — refusing to restore automatically. This needs manual review.'
+        });
+      }
+    }
 
     if (!codeWasUsed) {
       if (useEntry) restoreFIFO(history, useEntry.consumed_from);
@@ -812,9 +869,10 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
   const customerId = order.customer?.id;
   if (!customerId) return res.status(200).send('ok');
 
-  try {
-    const orderId = order.id;
+  const orderId = order.id;
 
+  try {
+    await withOrderLock(orderId, async () => {
     const usedCoupons     = (order.discount_codes || []).map(d => (d.code || '').toUpperCase());
     const usedBonusCoupon = usedCoupons.includes(BONUS_COUPON.toUpperCase());
     const amountPaid      = Math.round(parseFloat(order.total_price) * 100);
@@ -830,6 +888,17 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
     const historyMF = await getMetafield(customerId, 'history');
     let history     = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+    // IDEMPOTENCY GUARD — Shopify redelivers webhooks. Without this check,
+    // every redelivery of the same order credits it again. This is the
+    // fix for the exact bug where order #1105 was credited 4 times.
+    const alreadyCredited = history.some(
+      h => h.type === 'earn' && h.order_id === String(orderId) && !h.reversed
+    );
+    if (alreadyCredited) {
+      console.log(`[order-paid] Order #${order.order_number} already credited — skipping duplicate delivery`);
+      return;
+    }
 
     const newBalance = balance + earnedPoints;
     const expiresAt   = new Date();
@@ -861,6 +930,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
     console.log(`[order-paid] Balance: ${balance} + ${earnedPoints} = ${newBalance}`);
 
     for (const d of rwrdCodes) await deleteRwrdCode(d.code);
+    }); // end withOrderLock
 
     res.status(200).send('ok');
   } catch (e) {
