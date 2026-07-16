@@ -15,34 +15,27 @@
  *   carries its own expires_at and expires independently, 6 months after credit
  *   by default. Manual credits require an explicit expires_at.
  *
- * Birthday points — INDEX-BACKED:
- *   A shop-level metafield (rewards/birthday_index) maps birth-month → list of
- *   customer IDs. It's built once at /api/admin/backfill-birthday-index and
- *   kept current automatically every time a customer saves their birthday via
- *   /api/save-birthday. The monthly cron (/api/cron/birthday) reads ONLY this
- *   index — it never re-scans the full customer list — so it costs roughly
- *   2 API calls per MATCHED customer and zero for everyone else, instead of
- *   1+ calls for every customer in the store every month.
+ * Birthday points — INDEX-BACKED: see rewards/birthday_index shop metafield.
+ *   Backfill once via /api/admin/backfill-birthday-index, then the monthly
+ *   cron reads only the index — never the full customer list.
  *
- *   Run /api/admin/backfill-birthday-index ONCE, right after this deploys, so
- *   customers who saved a birthday before this index existed aren't invisible
- *   to it. Safe to re-run any time (e.g. after a bulk customer import) — it
- *   fully rebuilds the index from what's actually stored in Shopify.
- *
- *   Awarded on the 1st of the birth month (day-of-month on the birthday itself
- *   is ignored), expires at the end of that same month.
+ * Stale applied-points recovery: a customer can apply points on the cart
+ *   page, which immediately deducts balance and creates a one-time Shopify
+ *   discount code — BEFORE any order exists. If they abandon checkout before
+ *   paying, no order-cancelled or refund-created webhook ever fires (no order
+ *   was created), so nothing would otherwise restore those points. GET
+ *   /api/points — already called on every cart-page load — now also checks
+ *   for applied codes older than STALE_APPLY_MS that were never actually used
+ *   in a completed order, restores the points, and deletes the unused
+ *   Shopify price rule/discount code. This uses the exact same
+ *   delete-then-credit sequence as the customer-initiated /api/restore route.
  *
  * Rate limiting: every outbound Shopify call is serialized through a single
- *   throttled queue (~1.8 req/sec) with automatic 429 retry. With the birthday
- *   index in place, cron traffic is now small enough that this alone is
- *   sufficient — no separate priority lanes needed for webhook vs. cron
- *   contention, since the cron no longer touches most of the customer list.
+ *   throttled queue (~1.8 req/sec) with automatic 429 retry.
  *
  * Manual point admin: no admin panel exists. Credits/debits are sent by hand
  *   via ReqBin as raw POST requests. There is deliberately no "set balance to
- *   X" action — only additive add-points / deduct-points — because a typo in
- *   a "set" call silently overwrites the whole balance with no way to detect
- *   the error after the fact.
+ *   X" action — only additive add-points / deduct-points.
  */
 
 const express = require('express');
@@ -61,6 +54,13 @@ const SECRET       = process.env.SHOPIFY_API_SECRET;
 const BONUS_COUPON         = 'FREE50';
 const POINTS_EXPIRY_MONTHS = 6;
 
+// How long an applied-but-unused RWRD- code is given before it's treated as
+// abandoned. Used both for /api/apply's "reuse an existing code" check and
+// for the auto-restore sweep in GET /api/points — one constant, so the two
+// can't silently drift apart. Front-end localStorage windows in
+// rewards-panel.js should be kept in sync with this value.
+const STALE_APPLY_MS = 30 * 60 * 1000; // 30 minutes
+
 const HEADERS = {
   'X-Shopify-Access-Token': TOKEN,
   'Content-Type': 'application/json'
@@ -68,11 +68,6 @@ const HEADERS = {
 
 /* ─────────────────────────────────────────
    RATE LIMITER
-   Shopify's REST Admin API enforces a leaky-bucket limit — roughly 40
-   request capacity, leaking at 2 requests/sec for standard app tokens.
-   Every outbound Shopify call goes through this single queue with a
-   fixed ~550ms gap between calls. Any 429 that still slips through is
-   retried automatically with backoff, inside the same queue slot.
    ───────────────────────────────────────── */
 const MIN_INTERVAL_MS = 550; // ≈1.8 req/sec, under Shopify's 2/sec ceiling
 const MAX_RETRIES     = 5;
@@ -179,17 +174,8 @@ async function setShopMetafield(key, value) {
 
 /* ─────────────────────────────────────────
    IN-PROCESS INDEX LOCK
-   The birthday_index shop metafield can be modified by concurrent
-   /api/save-birthday requests. Without serialization, two customers
-   saving at nearly the same instant could each read the same version,
-   and the second write would silently overwrite the first customer's
-   entry (last-write-wins). This queue forces every index read-modify-
-   write in this file through one line at a time, on this process.
-   Limitation, stated plainly: this only protects a SINGLE running
-   instance. If this app is ever scaled to multiple instances behind a
-   load balancer, this lock no longer prevents the race — a distributed
-   lock (or Shopify's GraphQL compareDigest) would be needed then. Not
-   needed for a single-instance Railway deployment.
+   Serializes concurrent birthday_index read-modify-writes on this single
+   process. Does not protect against multiple horizontally-scaled instances.
    ───────────────────────────────────────── */
 let indexQueue = Promise.resolve();
 
@@ -272,7 +258,68 @@ async function processExpiry(customerId, balance, history) {
 }
 
 /* ─────────────────────────────────────────
+   STALE APPLIED-POINTS RECOVERY
+   Finds 'use' entries with an RWRD- discount code, not yet refunded, older
+   than STALE_APPLY_MS. For each, checks Shopify directly whether the code
+   was ever actually used in a completed order:
+     - usage_count === 0 → genuinely abandoned. Delete the unused price rule
+       (same call /api/restore already makes), remove the history entry
+       entirely (matches /api/restore's semantics — nothing ever happened),
+       and credit the points back to balance.
+     - usage_count > 0   → an order WAS placed with this code. Leave it
+       alone; order-paid already accounts for it correctly elsewhere.
+   A lookup failure (code already gone, network hiccup) is treated as
+   "nothing to restore" rather than surfaced as an error — consistent with
+   how /api/check-code already fails safe on the same kind of lookup.
+   ───────────────────────────────────────── */
+async function restoreStaleAppliedCodes(customerId, balance, history) {
+  const now = Date.now();
+  let changed = false;
+
+  const staleEntries = history.filter(h =>
+    h.type === 'use' &&
+    !h.refunded &&
+    h.discount_code?.startsWith('RWRD-') &&
+    (now - new Date(h.created_at).getTime()) > STALE_APPLY_MS
+  );
+
+  for (const entry of staleEntries) {
+    try {
+      const lookup = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(entry.discount_code)}`);
+      const priceRuleId = lookup.discount_code?.price_rule_id;
+
+      let usageCount = 0;
+      if (priceRuleId) {
+        const codeData = await shopifyFetch(`/price_rules/${priceRuleId}/discount_codes.json`);
+        const codeObj  = (codeData.discount_codes || []).find(c => c.code === entry.discount_code);
+        usageCount = codeObj?.usage_count ?? 0;
+      }
+
+      if (usageCount === 0) {
+        if (priceRuleId) {
+          await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
+          console.log(`[auto-restore] Deleted unused price rule ${priceRuleId} (${entry.discount_code})`);
+        }
+        balance += entry.points;
+        history  = history.filter(h => h !== entry);
+        changed  = true;
+        console.log(`[auto-restore] Customer ${customerId}: restored ${entry.points}pts from abandoned checkout (${entry.discount_code})`);
+      }
+      // usageCount > 0 means an order actually completed with this code —
+      // nothing stale about it, leave it exactly as-is.
+    } catch (e) {
+      console.log(`[auto-restore] Could not verify ${entry.discount_code}, skipping: ${e.message}`);
+    }
+  }
+
+  return { balance, history, changed };
+}
+
+/* ─────────────────────────────────────────
    ROUTE: GET /api/points
+   Runs expiry, THEN the stale-applied-points sweep, writing back once
+   if either made a change. Both are lazy checks — no cron needed — since
+   this route is already called on every cart-page load.
    ───────────────────────────────────────── */
 app.get('/api/points', async (req, res) => {
   const { customer_id } = req.query;
@@ -288,9 +335,19 @@ app.get('/api/points', async (req, res) => {
     let history = [];
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    const result = await processExpiry(customer_id, balance, history);
-    balance = result.balance;
-    history = result.history;
+    const expiryResult = await processExpiry(customer_id, balance, history);
+    balance = expiryResult.balance;
+    history = expiryResult.history;
+
+    const staleResult = await restoreStaleAppliedCodes(customer_id, balance, history);
+    if (staleResult.changed) {
+      balance = staleResult.balance;
+      history = staleResult.history;
+      await Promise.all([
+        setMetafield(customer_id, 'balance', balance, 'integer'),
+        setMetafield(customer_id, 'history', history, 'json')
+      ]);
+    }
 
     const birthdayMF   = await getMetafield(customer_id, 'birthday');
     const has_birthday = !!birthdayMF;
@@ -352,7 +409,7 @@ app.post('/api/apply', async (req, res) => {
     const existing = history.find(
       h => h.type === 'use' && h.points === ptsInt && !h.refunded
         && h.discount_code?.startsWith('RWRD-')
-        && (Date.now() - new Date(h.created_at).getTime()) < 30 * 60 * 1000
+        && (Date.now() - new Date(h.created_at).getTime()) < STALE_APPLY_MS
     );
     if (existing) {
       console.log(`[apply] Reusing code ${existing.discount_code}`);
@@ -483,6 +540,8 @@ app.post('/api/update-apply', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/restore
+   Customer-initiated instant restore — identical delete-then-credit
+   sequence to the automatic sweep above.
    ───────────────────────────────────────── */
 app.post('/api/restore', async (req, res) => {
   const { customer_id, points, discount_code } = req.body;
@@ -955,12 +1014,6 @@ app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/save-birthday
-   Saves the customer's birthday AND keeps the shop-level birthday_index
-   metafield (month → [customer IDs]) in sync, so the monthly cron never
-   needs to re-scan the full customer list. The index update is wrapped
-   in withIndexLock to serialize concurrent saves on this process — see
-   the IN-PROCESS INDEX LOCK comment above for what that does and does
-   not protect against.
    ───────────────────────────────────────── */
 app.post('/api/save-birthday', async (req, res) => {
   const { customer_id, birthday } = req.body;
@@ -981,8 +1034,6 @@ app.post('/api/save-birthday', async (req, res) => {
       let index = {};
       if (indexMF) { try { index = JSON.parse(indexMF.value); } catch {} }
 
-      // Remove this customer from any previous month bucket first —
-      // handles the case where a customer edits an already-saved birthday.
       for (const m of Object.keys(index)) {
         index[m] = (index[m] || []).filter(id => id !== custId);
       }
@@ -1002,17 +1053,6 @@ app.post('/api/save-birthday', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/admin/backfill-birthday-index
-   ONE-TIME (but safe to re-run) tool: pages through EVERY customer once,
-   reads their birthday metafield if set, and rebuilds birthday_index
-   from scratch. Run this once right after deploying the index-based
-   cron below, so customers who saved a birthday before the index existed
-   aren't invisible to it. Also safe to re-run after a bulk customer
-   import, or any time you suspect the index has drifted from reality.
-
-   This is the only route that still does a full customer-list scan —
-   by design, since it only needs to run rarely, not every month.
-   Protected by ADMIN_SECRET. Guards against being triggered twice
-   concurrently (the only realistic way this route could corrupt data).
    ───────────────────────────────────────── */
 let backfillRunning = false;
 
@@ -1022,9 +1062,6 @@ app.post('/api/admin/backfill-birthday-index', requireAdminAuth, async (req, res
   }
   backfillRunning = true;
 
-  // Respond immediately — a full customer scan can take a while, and
-  // ReqBin / whatever triggers this shouldn't need to hold the
-  // connection open for the whole run.
   res.json({ ok: true, status: 'backfill_started' });
 
   try {
@@ -1082,24 +1119,6 @@ app.post('/api/admin/backfill-birthday-index', requireAdminAuth, async (req, res
 
 /* ─────────────────────────────────────────
    ROUTE: GET /api/cron/birthday
-   Run monthly, on the 1st, via external cron.
-
-   INDEX-BACKED: reads the birthday_index shop metafield (built by the
-   backfill route and kept current by /api/save-birthday) to find
-   exactly which customers have a birthday in the current month. Does
-   NOT scan the full customer list — cost is roughly 2 API calls per
-   MATCHED customer, zero for everyone else.
-
-   If a customer ID in the index no longer exists in Shopify (deleted
-   customer), it's evicted from the index at the end of this run instead
-   of erroring on that ID every month indefinitely.
-
-   Points expire at 23:59:59 on the last day of the current month,
-   regardless of which day of the month the cron actually fires on.
-   Protected by ADMIN_SECRET.
-
-   Cron schedule required: 0 0 1 * *  (00:00 on the 1st of every month)
-   GET https://your-railway-url.up.railway.app/api/cron/birthday?secret=YOUR_ADMIN_SECRET
    ───────────────────────────────────────── */
 const BIRTHDAY_POINTS = 100;
 
@@ -1169,9 +1188,6 @@ app.get('/api/cron/birthday', async (req, res) => {
       console.log(`[cron/birthday] Customer ${customerId}: +${BIRTHDAY_POINTS} pts. Balance: ${balance} → ${newBalance}. Expires ${expiresAtISO}`);
       awarded++;
     } catch (e) {
-      // A 404-style error here almost always means the customer no
-      // longer exists in Shopify — evict them from the index so this
-      // route doesn't keep erroring on the same dead ID every month.
       const looksDeleted = /error 404/i.test(e.message);
       if (looksDeleted) {
         staleIds.push(customerId);
