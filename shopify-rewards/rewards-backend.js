@@ -333,13 +333,31 @@ async function deleteRwrdCode(code) {
    version (which the order_id idempotency check below already covers on
    its own for deliveries spaced apart in time).
    ───────────────────────────────────────── */
-const orderLocks = new Map();
+/* ─────────────────────────────────────────
+   PER-CUSTOMER PROCESSING LOCK
+   Every route that reads-then-writes a customer's balance/history
+   metafields must be serialized against every OTHER route touching that
+   SAME customer — not just against retries of itself. Without this, an
+   order-paid webhook and a concurrent /api/apply (or /api/restore, or the
+   periodic sweep) for the same customer can both read balance before
+   either writes, and whichever writes last silently overwrites the
+   other's update — a real lost-update race, not theoretical: this is
+   exactly what happened to a live customer, where a genuine points
+   redemption's balance deduction was clobbered by a concurrently-running
+   order-paid webhook that read a stale balance a few seconds later.
+   A per-order lock (checking only "is this the same order_id") is not
+   sufficient — it doesn't protect against a DIFFERENT route for the SAME
+   customer racing in. Locking at the customer level is a strict superset
+   of order-level locking, since every order belongs to exactly one
+   customer.
+   ───────────────────────────────────────── */
+const customerLocks = new Map();
 
-function withOrderLock(orderId, fn) {
-  const key  = String(orderId);
-  const prev = orderLocks.get(key) || Promise.resolve();
+function withCustomerLock(customerId, fn) {
+  const key  = String(customerId);
+  const prev = customerLocks.get(key) || Promise.resolve();
   const run  = prev.then(fn);
-  orderLocks.set(key, run.catch(() => {}));
+  customerLocks.set(key, run.catch(() => {}));
   return run;
 }
 
@@ -455,36 +473,38 @@ async function sweepPendingApplies() {
       if (now - appliedAt < STALE_APPLY_MS) continue;
 
       try {
-        const historyMF = await getMetafield(customerId, 'history');
-        let history = [];
-        if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+        await withCustomerLock(customerId, async () => {
+          const historyMF = await getMetafield(customerId, 'history');
+          let history = [];
+          if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-        const entry = history.find(h => h.type === 'use' && h.discount_code === discountCode && !h.refunded);
+          const entry = history.find(h => h.type === 'use' && h.discount_code === discountCode && !h.refunded);
 
-        if (!entry || entry.confirmed) {
+          if (!entry || entry.confirmed) {
+            unregisterPendingApply(customerId, discountCode);
+            return;
+          }
+
+          const { usageCount } = await lookupAndCleanupCode(discountCode);
+
+          if (usageCount === 0) {
+            const balanceMF = await getMetafield(customerId, 'balance');
+            const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+
+            restoreFIFO(history, entry.consumed_from);
+            const newBalance = balance + entry.points;
+            const newHistory = history.filter(h => h !== entry);
+
+            await Promise.all([
+              setMetafield(customerId, 'balance', newBalance, 'integer'),
+              setMetafield(customerId, 'history', newHistory, 'json')
+            ]);
+
+            console.log(`[auto-restore-sweep] Customer ${customerId}: restored ${entry.points}pts (${discountCode}). Balance ${balance} → ${newBalance}`);
+          }
+
           unregisterPendingApply(customerId, discountCode);
-          continue;
-        }
-
-        const { usageCount } = await lookupAndCleanupCode(discountCode);
-
-        if (usageCount === 0) {
-          const balanceMF = await getMetafield(customerId, 'balance');
-          const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-
-          restoreFIFO(history, entry.consumed_from);
-          const newBalance = balance + entry.points;
-          const newHistory = history.filter(h => h !== entry);
-
-          await Promise.all([
-            setMetafield(customerId, 'balance', newBalance, 'integer'),
-            setMetafield(customerId, 'history', newHistory, 'json')
-          ]);
-
-          console.log(`[auto-restore-sweep] Customer ${customerId}: restored ${entry.points}pts (${discountCode}). Balance ${balance} → ${newBalance}`);
-        }
-
-        unregisterPendingApply(customerId, discountCode);
+        });
       } catch (e) {
         console.error(`[auto-restore-sweep] Error resolving ${discountCode} for customer ${customerId}:`, e.message);
       }
@@ -504,33 +524,35 @@ app.get('/api/points', async (req, res) => {
   if (!customer_id) return res.status(400).json({ error: 'Missing customer_id' });
 
   try {
-    const [balanceMF, historyMF] = await Promise.all([
-      getMetafield(customer_id, 'balance'),
-      getMetafield(customer_id, 'history')
-    ]);
-
-    let balance = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    let history = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
-
-    const expiryResult = await processExpiry(customer_id, balance, history);
-    balance = expiryResult.balance;
-    history = expiryResult.history;
-
-    const staleResult = await restoreStaleAppliedCodes(customer_id, balance, history);
-    if (staleResult.changed) {
-      balance = staleResult.balance;
-      history = staleResult.history;
-      await Promise.all([
-        setMetafield(customer_id, 'balance', balance, 'integer'),
-        setMetafield(customer_id, 'history', history, 'json')
+    await withCustomerLock(customer_id, async () => {
+      const [balanceMF, historyMF] = await Promise.all([
+        getMetafield(customer_id, 'balance'),
+        getMetafield(customer_id, 'history')
       ]);
-    }
 
-    const birthdayMF   = await getMetafield(customer_id, 'birthday');
-    const has_birthday = !!birthdayMF;
+      let balance = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      let history = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    res.json({ balance, history: history.slice(0, 20), is_first_order: false, has_birthday });
+      const expiryResult = await processExpiry(customer_id, balance, history);
+      balance = expiryResult.balance;
+      history = expiryResult.history;
+
+      const staleResult = await restoreStaleAppliedCodes(customer_id, balance, history);
+      if (staleResult.changed) {
+        balance = staleResult.balance;
+        history = staleResult.history;
+        await Promise.all([
+          setMetafield(customer_id, 'balance', balance, 'integer'),
+          setMetafield(customer_id, 'history', history, 'json')
+        ]);
+      }
+
+      const birthdayMF   = await getMetafield(customer_id, 'birthday');
+      const has_birthday = !!birthdayMF;
+
+      res.json({ balance, history: history.slice(0, 20), is_first_order: false, has_birthday });
+    });
   } catch (e) {
     console.error('[points GET]', e.message);
     res.status(500).json({ error: e.message });
@@ -578,57 +600,60 @@ app.post('/api/apply', async (req, res) => {
   }
 
   try {
-    const balanceMF = await getMetafield(customer_id, 'balance');
-    const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    if (ptsInt > balance) return res.status(400).json({ error: 'Insufficient points' });
+    await withCustomerLock(customer_id, async () => {
+      const balanceMF = await getMetafield(customer_id, 'balance');
+      const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      if (ptsInt > balance) { res.status(400).json({ error: 'Insufficient points' }); return; }
 
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+      const historyMF = await getMetafield(customer_id, 'history');
+      let history = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    const existing = history.find(
-      h => h.type === 'use' && h.points === ptsInt && !h.refunded
-        && h.discount_code?.startsWith('RWRD-')
-        && (Date.now() - new Date(h.created_at).getTime()) < STALE_APPLY_MS
-    );
-    if (existing) {
-      console.log(`[apply] Reusing code ${existing.discount_code}`);
-      registerPendingApply(customer_id, existing.discount_code);
-      return res.json({ discount_code: existing.discount_code, discount_amount: ptsInt });
-    }
+      const existing = history.find(
+        h => h.type === 'use' && h.points === ptsInt && !h.refunded
+          && h.discount_code?.startsWith('RWRD-')
+          && (Date.now() - new Date(h.created_at).getTime()) < STALE_APPLY_MS
+      );
+      if (existing) {
+        console.log(`[apply] Reusing code ${existing.discount_code}`);
+        registerPendingApply(customer_id, existing.discount_code);
+        res.json({ discount_code: existing.discount_code, discount_amount: ptsInt });
+        return;
+      }
 
-    const code         = `RWRD-${customer_id}-${Date.now()}`;
-    const discountData = await shopifyFetch('/price_rules.json', {
-      method: 'POST',
-      body: JSON.stringify({
-        price_rule: {
-          title: `Rewards redemption ${code}`, target_type: 'line_item', target_selection: 'all',
-          allocation_method: 'across', value_type: 'fixed_amount', value: `-${ptsInt}.00`,
-          customer_selection: 'prerequisite', prerequisite_customer_ids: [parseInt(customer_id)],
-          usage_limit: 1, once_per_customer: true, starts_at: new Date().toISOString()
-        }
-      })
+      const code         = `RWRD-${customer_id}-${Date.now()}`;
+      const discountData = await shopifyFetch('/price_rules.json', {
+        method: 'POST',
+        body: JSON.stringify({
+          price_rule: {
+            title: `Rewards redemption ${code}`, target_type: 'line_item', target_selection: 'all',
+            allocation_method: 'across', value_type: 'fixed_amount', value: `-${ptsInt}.00`,
+            customer_selection: 'prerequisite', prerequisite_customer_ids: [parseInt(customer_id)],
+            usage_limit: 1, once_per_customer: true, starts_at: new Date().toISOString()
+          }
+        })
+      });
+
+      await shopifyFetch(`/price_rules/${discountData.price_rule.id}/discount_codes.json`, {
+        method: 'POST', body: JSON.stringify({ discount_code: { code } })
+      });
+
+      const consumedFrom = consumeFIFO(history, ptsInt);
+
+      history.unshift({
+        type: 'use', id: generateEntryId(), description: `${ptsInt} points redeemed`, points: ptsInt,
+        discount_code: code, created_at: new Date().toISOString(), consumed_from: consumedFrom
+      });
+
+      await Promise.all([
+        setMetafield(customer_id, 'balance', balance - ptsInt, 'integer'),
+        setMetafield(customer_id, 'history', history, 'json')
+      ]);
+
+      registerPendingApply(customer_id, code);
+      console.log(`[apply] Customer ${customer_id}: ${ptsInt}pts → code ${code}`);
+      res.json({ discount_code: code, discount_amount: ptsInt });
     });
-
-    await shopifyFetch(`/price_rules/${discountData.price_rule.id}/discount_codes.json`, {
-      method: 'POST', body: JSON.stringify({ discount_code: { code } })
-    });
-
-    const consumedFrom = consumeFIFO(history, ptsInt);
-
-    history.unshift({
-      type: 'use', id: generateEntryId(), description: `${ptsInt} points redeemed`, points: ptsInt,
-      discount_code: code, created_at: new Date().toISOString(), consumed_from: consumedFrom
-    });
-
-    await Promise.all([
-      setMetafield(customer_id, 'balance', balance - ptsInt, 'integer'),
-      setMetafield(customer_id, 'history', history, 'json')
-    ]);
-
-    registerPendingApply(customer_id, code);
-    console.log(`[apply] Customer ${customer_id}: ${ptsInt}pts → code ${code}`);
-    res.json({ discount_code: code, discount_amount: ptsInt });
   } catch (e) {
     console.error('[apply]', e.message);
     res.status(500).json({ error: e.message });
@@ -658,80 +683,80 @@ app.post('/api/update-apply', async (req, res) => {
   }
 
   try {
-    const balanceMF = await getMetafield(customer_id, 'balance');
-    let balance     = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history     = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+    await withCustomerLock(customer_id, async () => {
+      const balanceMF = await getMetafield(customer_id, 'balance');
+      let balance     = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      const historyMF = await getMetafield(customer_id, 'history');
+      let history     = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    const oldEntry = history.find(h => h.type === 'use' && h.discount_code === old_discount_code);
+      const oldEntry = history.find(h => h.type === 'use' && h.discount_code === old_discount_code);
 
-    // Same ground-truth-first check as /api/restore — never restore a
-    // code order-paid already confirmed as legitimately used.
-    if (oldEntry?.confirmed) {
-      return res.status(409).json({ error: 'This redemption was already used in a completed order and cannot be modified.' });
-    }
-    if (oldEntry?.refunded) {
-      return res.status(409).json({ error: 'This redemption was already refunded and cannot be modified.' });
-    }
+      if (oldEntry?.confirmed) {
+        res.status(409).json({ error: 'This redemption was already used in a completed order and cannot be modified.' });
+        return;
+      }
+      if (oldEntry?.refunded) {
+        res.status(409).json({ error: 'This redemption was already refunded and cannot be modified.' });
+        return;
+      }
 
-    let oldCodeWasUsed;
-    try {
-      const { usageCount } = await lookupAndCleanupCode(old_discount_code);
-      oldCodeWasUsed = usageCount > 0;
-    } catch (e) {
-      // FAIL-SAFE: same reasoning as /api/restore — an unverifiable old
-      // code must not default to "safe to restore." Refuse the whole
-      // update rather than risk wrongly crediting points back.
-      console.log(`[update-apply] Old code lookup failed for ${old_discount_code}: ${e.message} — refusing to proceed`);
-      return res.status(409).json({ error: 'Could not verify old code status — please reload and try again.' });
-    }
+      let oldCodeWasUsed;
+      try {
+        const { usageCount } = await lookupAndCleanupCode(old_discount_code);
+        oldCodeWasUsed = usageCount > 0;
+      } catch (e) {
+        console.log(`[update-apply] Old code lookup failed for ${old_discount_code}: ${e.message} — refusing to proceed`);
+        res.status(409).json({ error: 'Could not verify old code status — please reload and try again.' });
+        return;
+      }
 
-    if (!oldCodeWasUsed) {
-      if (oldEntry) restoreFIFO(history, oldEntry.consumed_from);
-      balance = balance + oldPts;
-      history = history.filter(h => !(h.type === 'use' && h.discount_code === old_discount_code));
-      console.log(`[update-apply] Old code unused — restored ${oldPts}pts`);
-    } else {
-      console.log(`[update-apply] Old code was used — cannot restore ${oldPts}pts`);
-    }
-    unregisterPendingApply(customer_id, old_discount_code);
+      if (!oldCodeWasUsed) {
+        if (oldEntry) restoreFIFO(history, oldEntry.consumed_from);
+        balance = balance + oldPts;
+        history = history.filter(h => !(h.type === 'use' && h.discount_code === old_discount_code));
+        console.log(`[update-apply] Old code unused — restored ${oldPts}pts`);
+      } else {
+        console.log(`[update-apply] Old code was used — cannot restore ${oldPts}pts`);
+      }
+      unregisterPendingApply(customer_id, old_discount_code);
 
-    balance = balance - newPts;
-    if (balance < 0) return res.status(400).json({ error: 'Insufficient points' });
+      balance = balance - newPts;
+      if (balance < 0) { res.status(400).json({ error: 'Insufficient points' }); return; }
 
-    const code         = `RWRD-${customer_id}-${Date.now()}`;
-    const discountData = await shopifyFetch('/price_rules.json', {
-      method: 'POST',
-      body: JSON.stringify({
-        price_rule: {
-          title: `Rewards redemption ${code}`, target_type: 'line_item', target_selection: 'all',
-          allocation_method: 'across', value_type: 'fixed_amount', value: `-${newPts}.00`,
-          customer_selection: 'prerequisite', prerequisite_customer_ids: [parseInt(customer_id)],
-          usage_limit: 1, once_per_customer: true, starts_at: new Date().toISOString()
-        }
-      })
+      const code         = `RWRD-${customer_id}-${Date.now()}`;
+      const discountData = await shopifyFetch('/price_rules.json', {
+        method: 'POST',
+        body: JSON.stringify({
+          price_rule: {
+            title: `Rewards redemption ${code}`, target_type: 'line_item', target_selection: 'all',
+            allocation_method: 'across', value_type: 'fixed_amount', value: `-${newPts}.00`,
+            customer_selection: 'prerequisite', prerequisite_customer_ids: [parseInt(customer_id)],
+            usage_limit: 1, once_per_customer: true, starts_at: new Date().toISOString()
+          }
+        })
+      });
+
+      await shopifyFetch(`/price_rules/${discountData.price_rule.id}/discount_codes.json`, {
+        method: 'POST', body: JSON.stringify({ discount_code: { code } })
+      });
+
+      const consumedFrom = consumeFIFO(history, newPts);
+
+      history.unshift({
+        type: 'use', id: generateEntryId(), description: `${newPts} points redeemed`, points: newPts,
+        discount_code: code, created_at: new Date().toISOString(), consumed_from: consumedFrom
+      });
+
+      await Promise.all([
+        setMetafield(customer_id, 'balance', balance, 'integer'),
+        setMetafield(customer_id, 'history', history, 'json')
+      ]);
+
+      registerPendingApply(customer_id, code);
+      console.log(`[update-apply] ${oldPts}→${newPts}pts. Balance=${balance}`);
+      res.json({ discount_code: code, discount_amount: newPts });
     });
-
-    await shopifyFetch(`/price_rules/${discountData.price_rule.id}/discount_codes.json`, {
-      method: 'POST', body: JSON.stringify({ discount_code: { code } })
-    });
-
-    const consumedFrom = consumeFIFO(history, newPts);
-
-    history.unshift({
-      type: 'use', id: generateEntryId(), description: `${newPts} points redeemed`, points: newPts,
-      discount_code: code, created_at: new Date().toISOString(), consumed_from: consumedFrom
-    });
-
-    await Promise.all([
-      setMetafield(customer_id, 'balance', balance, 'integer'),
-      setMetafield(customer_id, 'history', history, 'json')
-    ]);
-
-    registerPendingApply(customer_id, code);
-    console.log(`[update-apply] ${oldPts}→${newPts}pts. Balance=${balance}`);
-    res.json({ discount_code: code, discount_amount: newPts });
   } catch (e) {
     console.error('[update-apply]', e.message);
     res.status(500).json({ error: e.message });
@@ -748,64 +773,58 @@ app.post('/api/restore', async (req, res) => {
   const pts = parseInt(points, 10);
 
   try {
-    const balanceMF = await getMetafield(customer_id, 'balance');
-    const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history     = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+    await withCustomerLock(customer_id, async () => {
+      const balanceMF = await getMetafield(customer_id, 'balance');
+      const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      const historyMF = await getMetafield(customer_id, 'history');
+      let history     = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    const useEntry = discount_code
-      ? history.find(h => h.type === 'use' && h.discount_code === discount_code)
-      : null;
+      const useEntry = discount_code
+        ? history.find(h => h.type === 'use' && h.discount_code === discount_code)
+        : null;
 
-    // Ground truth from our own webhook beats an ambiguous Shopify lookup.
-    // If order-paid already confirmed this code was legitimately used,
-    // never restore it — regardless of what a lookup says, or whether a
-    // lookup even succeeds.
-    if (useEntry?.confirmed) {
-      console.log(`[restore] Code ${discount_code} already confirmed used in order ${useEntry.redeemed_in_order} — refusing to restore`);
-      return res.json({ ok: true, restored: false, reason: 'already_confirmed_used' });
-    }
-    if (useEntry?.refunded) {
-      console.log(`[restore] Code ${discount_code} already refunded — refusing to restore again`);
-      return res.json({ ok: true, restored: false, reason: 'already_refunded' });
-    }
-
-    let codeWasUsed = false;
-    if (discount_code) {
-      try {
-        const { usageCount } = await lookupAndCleanupCode(discount_code);
-        codeWasUsed = usageCount > 0;
-      } catch (e) {
-        // FAIL-SAFE: a lookup failure — including a 404, which is what
-        // Shopify returns for a code that's ALREADY BEEN DELETED, whether
-        // that's because it was legitimately used or because it was
-        // already restored once — must NOT default to "safe to restore."
-        // This is the exact bug that let one abandoned-code lookup
-        // failure turn into a repeated wrongful restore on every retry.
-        // Refuse and surface it for manual review instead of guessing.
-        console.log(`[restore] Code lookup failed for ${discount_code}: ${e.message} — refusing to restore automatically`);
-        return res.status(409).json({
-          ok: false,
-          error: 'Could not verify code status — refusing to restore automatically. This needs manual review.'
-        });
+      if (useEntry?.confirmed) {
+        console.log(`[restore] Code ${discount_code} already confirmed used in order ${useEntry.redeemed_in_order} — refusing to restore`);
+        res.json({ ok: true, restored: false, reason: 'already_confirmed_used' });
+        return;
       }
-    }
+      if (useEntry?.refunded) {
+        console.log(`[restore] Code ${discount_code} already refunded — refusing to restore again`);
+        res.json({ ok: true, restored: false, reason: 'already_refunded' });
+        return;
+      }
 
-    if (!codeWasUsed) {
-      if (useEntry) restoreFIFO(history, useEntry.consumed_from);
-      history = history.filter(h => !(h.type === 'use' && h.discount_code === discount_code));
-      await Promise.all([
-        setMetafield(customer_id, 'balance', balance + pts, 'integer'),
-        setMetafield(customer_id, 'history', history, 'json')
-      ]);
-      console.log(`[restore] Restored ${pts}pts. New balance: ${balance + pts}`);
-    } else {
-      console.log(`[restore] Code was used — points not restored`);
-    }
+      let codeWasUsed = false;
+      if (discount_code) {
+        try {
+          const { usageCount } = await lookupAndCleanupCode(discount_code);
+          codeWasUsed = usageCount > 0;
+        } catch (e) {
+          console.log(`[restore] Code lookup failed for ${discount_code}: ${e.message} — refusing to restore automatically`);
+          res.status(409).json({
+            ok: false,
+            error: 'Could not verify code status — refusing to restore automatically. This needs manual review.'
+          });
+          return;
+        }
+      }
 
-    if (discount_code) unregisterPendingApply(customer_id, discount_code);
-    res.json({ ok: true, restored: !codeWasUsed });
+      if (!codeWasUsed) {
+        if (useEntry) restoreFIFO(history, useEntry.consumed_from);
+        history = history.filter(h => !(h.type === 'use' && h.discount_code === discount_code));
+        await Promise.all([
+          setMetafield(customer_id, 'balance', balance + pts, 'integer'),
+          setMetafield(customer_id, 'history', history, 'json')
+        ]);
+        console.log(`[restore] Restored ${pts}pts. New balance: ${balance + pts}`);
+      } else {
+        console.log(`[restore] Code was used — points not restored`);
+      }
+
+      if (discount_code) unregisterPendingApply(customer_id, discount_code);
+      res.json({ ok: true, restored: !codeWasUsed });
+    });
   } catch (e) {
     console.error('[restore]', e.message);
     res.status(500).json({ error: e.message });
@@ -828,28 +847,31 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
   if (!customerId) return res.status(200).send('ok');
 
   try {
-    const existing = await getMetafield(customerId, 'balance');
-    if (existing) {
-      console.log(`[customer-created] Customer ${customerId} already has points — skipping welcome bonus`);
-      return res.status(200).send('ok');
-    }
+    await withCustomerLock(customerId, async () => {
+      const existing = await getMetafield(customerId, 'balance');
+      if (existing) {
+        console.log(`[customer-created] Customer ${customerId} already has points — skipping welcome bonus`);
+        res.status(200).send('ok');
+        return;
+      }
 
-    const expiresAt = new Date();
-    expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
+      const expiresAt = new Date();
+      expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
 
-    const history = [{
-      type: 'earn', id: generateEntryId(), description: 'Welcome bonus', points: WELCOME_POINTS,
-      remaining_points: WELCOME_POINTS, created_at: new Date().toISOString(),
-      expires_at: expiresAt.toISOString(), is_welcome: true
-    }];
+      const history = [{
+        type: 'earn', id: generateEntryId(), description: 'Welcome bonus', points: WELCOME_POINTS,
+        remaining_points: WELCOME_POINTS, created_at: new Date().toISOString(),
+        expires_at: expiresAt.toISOString(), is_welcome: true
+      }];
 
-    await Promise.all([
-      setMetafield(customerId, 'balance', WELCOME_POINTS, 'integer'),
-      setMetafield(customerId, 'history', history, 'json')
-    ]);
+      await Promise.all([
+        setMetafield(customerId, 'balance', WELCOME_POINTS, 'integer'),
+        setMetafield(customerId, 'history', history, 'json')
+      ]);
 
-    console.log(`[customer-created] Customer ${customerId} (${customer.email}) — ${WELCOME_POINTS} welcome pts credited`);
-    res.status(200).send('ok');
+      console.log(`[customer-created] Customer ${customerId} (${customer.email}) — ${WELCOME_POINTS} welcome pts credited`);
+      res.status(200).send('ok');
+    });
   } catch (e) {
     console.error('[customer-created]', e.message);
     res.status(500).send('error');
@@ -872,7 +894,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
   const orderId = order.id;
 
   try {
-    await withOrderLock(orderId, async () => {
+    await withCustomerLock(customerId, async () => {
     const usedCoupons     = (order.discount_codes || []).map(d => (d.code || '').toUpperCase());
     const usedBonusCoupon = usedCoupons.includes(BONUS_COUPON.toUpperCase());
     const amountPaid      = Math.round(parseFloat(order.total_price) * 100);
@@ -930,7 +952,7 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
     console.log(`[order-paid] Balance: ${balance} + ${earnedPoints} = ${newBalance}`);
 
     for (const d of rwrdCodes) await deleteRwrdCode(d.code);
-    }); // end withOrderLock
+    }); // end withCustomerLock
 
     res.status(200).send('ok');
   } catch (e) {
@@ -953,73 +975,76 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
   if (!customerId) return res.status(200).send('ok');
 
   try {
-    const orderId     = String(order.id);
-    const orderNumber = order.order_number;
+    await withCustomerLock(customerId, async () => {
+      const orderId     = String(order.id);
+      const orderNumber = order.order_number;
 
-    const balanceMF = await getMetafield(customerId, 'balance');
-    let balance     = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    const historyMF = await getMetafield(customerId, 'history');
-    let history     = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+      const balanceMF = await getMetafield(customerId, 'balance');
+      let balance     = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      const historyMF = await getMetafield(customerId, 'history');
+      let history     = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    let pointsDeducted = 0;
-    let pointsCredited = 0;
+      let pointsDeducted = 0;
+      let pointsCredited = 0;
 
-    const earnEntry = history.find(h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed);
-    if (earnEntry) {
-      pointsDeducted             = earnEntry.points;
-      earnEntry.reversed         = true;
-      earnEntry.remaining_points = 0;
-      balance                    = Math.max(0, balance - pointsDeducted);
-      console.log(`[order-cancelled] Reversing ${pointsDeducted} earned pts`);
-    }
-
-    const rwrdCodes = (order.discount_codes || [])
-      .filter(d => d.code?.startsWith('RWRD-'))
-      .map(d => Math.round(parseFloat(d.amount)));
-
-    if (rwrdCodes.length > 0) {
-      const refundPts = rwrdCodes.reduce((sum, a) => sum + a, 0);
-      const useEntry  = history.find(h => h.type === 'use' && h.points === refundPts && !h.refunded);
-      if (useEntry) {
-        restoreFIFO(history, useEntry.consumed_from);
-        pointsCredited    = refundPts;
-        useEntry.refunded = true;
-        balance          += pointsCredited;
-        console.log(`[order-cancelled] Crediting back ${pointsCredited} redeemed pts`);
+      const earnEntry = history.find(h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed);
+      if (earnEntry) {
+        pointsDeducted             = earnEntry.points;
+        earnEntry.reversed         = true;
+        earnEntry.remaining_points = 0;
+        balance                    = Math.max(0, balance - pointsDeducted);
+        console.log(`[order-cancelled] Reversing ${pointsDeducted} earned pts`);
       }
-    }
 
-    if (pointsDeducted === 0 && pointsCredited === 0) {
-      console.log(`[order-cancelled] Order #${orderNumber}: no points to adjust`);
-      return res.status(200).send('ok');
-    }
+      const rwrdCodes = (order.discount_codes || [])
+        .filter(d => d.code?.startsWith('RWRD-'))
+        .map(d => Math.round(parseFloat(d.amount)));
 
-    const parts = [];
-    if (pointsDeducted > 0) parts.push(`−${pointsDeducted} pts earned reversed`);
-    if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
+      if (rwrdCodes.length > 0) {
+        const refundPts = rwrdCodes.reduce((sum, a) => sum + a, 0);
+        const useEntry  = history.find(h => h.type === 'use' && h.points === refundPts && !h.refunded);
+        if (useEntry) {
+          restoreFIFO(history, useEntry.consumed_from);
+          pointsCredited    = refundPts;
+          useEntry.refunded = true;
+          balance          += pointsCredited;
+          console.log(`[order-cancelled] Crediting back ${pointsCredited} redeemed pts`);
+        }
+      }
 
-    history.unshift({
-      type: pointsCredited >= pointsDeducted ? 'earn' : 'use', id: generateEntryId(),
-      description: `Order #${orderNumber} cancelled: ${parts.join(', ')}`,
-      points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
-      order_id: orderId, is_adjustment: true
+      if (pointsDeducted === 0 && pointsCredited === 0) {
+        console.log(`[order-cancelled] Order #${orderNumber}: no points to adjust`);
+        res.status(200).send('ok');
+        return;
+      }
+
+      const parts = [];
+      if (pointsDeducted > 0) parts.push(`−${pointsDeducted} pts earned reversed`);
+      if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
+
+      history.unshift({
+        type: pointsCredited >= pointsDeducted ? 'earn' : 'use', id: generateEntryId(),
+        description: `Order #${orderNumber} cancelled: ${parts.join(', ')}`,
+        points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
+        order_id: orderId, is_adjustment: true
+      });
+
+      await Promise.all([
+        setMetafield(customerId, 'balance', balance, 'integer'),
+        setMetafield(customerId, 'history', history, 'json')
+      ]);
+
+      console.log(`[order-cancelled] Done. New balance: ${balance}`);
+
+      const codesToDelete = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
+      for (const d of codesToDelete) {
+        await deleteRwrdCode(d.code);
+        unregisterPendingApply(customerId, d.code);
+      }
+
+      res.status(200).send('ok');
     });
-
-    await Promise.all([
-      setMetafield(customerId, 'balance', balance, 'integer'),
-      setMetafield(customerId, 'history', history, 'json')
-    ]);
-
-    console.log(`[order-cancelled] Done. New balance: ${balance}`);
-
-    const codesToDelete = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
-    for (const d of codesToDelete) {
-      await deleteRwrdCode(d.code);
-      unregisterPendingApply(customerId, d.code);
-    }
-
-    res.status(200).send('ok');
   } catch (e) {
     console.error('[order-cancelled]', e.message);
     res.status(500).send('error');
@@ -1062,85 +1087,88 @@ app.post('/api/webhook/refund-created', express.raw({ type: 'application/json' }
   if (!customerId) return res.status(200).send('ok');
 
   try {
-    const orderNumber   = order.order_number;
-    const originalTotal = Math.round(parseFloat(order.total_price) * 100);
-    const refundAmount  = Math.round(
-      (refund.transactions || [])
-        .filter(t => t.kind === 'refund' && t.status === 'success')
-        .reduce((sum, t) => sum + parseFloat(t.amount || 0), 0) * 100
-    );
-    const isFullRefund = order.financial_status === 'refunded' || refundAmount >= originalTotal;
+    await withCustomerLock(customerId, async () => {
+      const orderNumber   = order.order_number;
+      const originalTotal = Math.round(parseFloat(order.total_price) * 100);
+      const refundAmount  = Math.round(
+        (refund.transactions || [])
+          .filter(t => t.kind === 'refund' && t.status === 'success')
+          .reduce((sum, t) => sum + parseFloat(t.amount || 0), 0) * 100
+      );
+      const isFullRefund = order.financial_status === 'refunded' || refundAmount >= originalTotal;
 
-    console.log(`[refund-created] Order #${orderNumber} | refund=₹${refundAmount/100} | full=${isFullRefund}`);
+      console.log(`[refund-created] Order #${orderNumber} | refund=₹${refundAmount/100} | full=${isFullRefund}`);
 
-    const balanceMF = await getMetafield(customerId, 'balance');
-    let balance     = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    const historyMF = await getMetafield(customerId, 'history');
-    let history     = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+      const balanceMF = await getMetafield(customerId, 'balance');
+      let balance     = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      const historyMF = await getMetafield(customerId, 'history');
+      let history     = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    let pointsDeducted = 0;
-    let pointsCredited = 0;
+      let pointsDeducted = 0;
+      let pointsCredited = 0;
 
-    const earnEntry = history.find(h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed);
-    if (earnEntry && earnEntry.points > 0) {
-      if (isFullRefund) {
-        pointsDeducted             = earnEntry.points;
-        earnEntry.reversed         = true;
-        earnEntry.remaining_points = 0;
-      } else {
-        const ratio      = Math.min(1, refundAmount / originalTotal);
-        pointsDeducted    = Math.floor(earnEntry.points * ratio);
-        earnEntry.points -= pointsDeducted;
-        earnEntry.remaining_points = Math.max(
-          0, (earnEntry.remaining_points ?? (earnEntry.points + pointsDeducted)) - pointsDeducted
-        );
+      const earnEntry = history.find(h => h.type === 'earn' && String(h.order_id) === orderId && !h.reversed);
+      if (earnEntry && earnEntry.points > 0) {
+        if (isFullRefund) {
+          pointsDeducted             = earnEntry.points;
+          earnEntry.reversed         = true;
+          earnEntry.remaining_points = 0;
+        } else {
+          const ratio      = Math.min(1, refundAmount / originalTotal);
+          pointsDeducted    = Math.floor(earnEntry.points * ratio);
+          earnEntry.points -= pointsDeducted;
+          earnEntry.remaining_points = Math.max(
+            0, (earnEntry.remaining_points ?? (earnEntry.points + pointsDeducted)) - pointsDeducted
+          );
+        }
+        balance = Math.max(0, balance - pointsDeducted);
+        console.log(`[refund-created] Reversing ${pointsDeducted} pts (${isFullRefund ? 'full' : 'partial'})`);
       }
-      balance = Math.max(0, balance - pointsDeducted);
-      console.log(`[refund-created] Reversing ${pointsDeducted} pts (${isFullRefund ? 'full' : 'partial'})`);
-    }
 
-    if (isFullRefund) {
-      const rwrdCodes = (order.discount_codes || [])
-        .filter(d => d.code?.startsWith('RWRD-'))
-        .map(d => Math.round(parseFloat(d.amount)));
+      if (isFullRefund) {
+        const rwrdCodes = (order.discount_codes || [])
+          .filter(d => d.code?.startsWith('RWRD-'))
+          .map(d => Math.round(parseFloat(d.amount)));
 
-      if (rwrdCodes.length > 0) {
-        const refundPts = rwrdCodes.reduce((sum, a) => sum + a, 0);
-        const useEntry  = history.find(h => h.type === 'use' && h.points === refundPts && !h.refunded);
-        if (useEntry) {
-          restoreFIFO(history, useEntry.consumed_from);
-          pointsCredited    = refundPts;
-          useEntry.refunded = true;
-          balance          += pointsCredited;
-          console.log(`[refund-created] Crediting back ${pointsCredited} redeemed pts`);
+        if (rwrdCodes.length > 0) {
+          const refundPts = rwrdCodes.reduce((sum, a) => sum + a, 0);
+          const useEntry  = history.find(h => h.type === 'use' && h.points === refundPts && !h.refunded);
+          if (useEntry) {
+            restoreFIFO(history, useEntry.consumed_from);
+            pointsCredited    = refundPts;
+            useEntry.refunded = true;
+            balance          += pointsCredited;
+            console.log(`[refund-created] Crediting back ${pointsCredited} redeemed pts`);
+          }
         }
       }
-    }
 
-    if (pointsDeducted === 0 && pointsCredited === 0) {
-      console.log(`[refund-created] Nothing to adjust for order #${orderNumber}`);
-      return res.status(200).send('ok');
-    }
+      if (pointsDeducted === 0 && pointsCredited === 0) {
+        console.log(`[refund-created] Nothing to adjust for order #${orderNumber}`);
+        res.status(200).send('ok');
+        return;
+      }
 
-    const parts = [];
-    if (pointsDeducted > 0) parts.push(`−${pointsDeducted} pts earned reversed`);
-    if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
+      const parts = [];
+      if (pointsDeducted > 0) parts.push(`−${pointsDeducted} pts earned reversed`);
+      if (pointsCredited > 0) parts.push(`+${pointsCredited} pts redeemed refunded`);
 
-    history.unshift({
-      type: pointsCredited >= pointsDeducted ? 'earn' : 'use', id: generateEntryId(),
-      description: `Order #${orderNumber} ${isFullRefund ? 'refunded' : 'partial refund'}: ${parts.join(', ')}`,
-      points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
-      order_id: orderId, is_adjustment: true
+      history.unshift({
+        type: pointsCredited >= pointsDeducted ? 'earn' : 'use', id: generateEntryId(),
+        description: `Order #${orderNumber} ${isFullRefund ? 'refunded' : 'partial refund'}: ${parts.join(', ')}`,
+        points: pointsCredited - pointsDeducted, created_at: new Date().toISOString(),
+        order_id: orderId, is_adjustment: true
+      });
+
+      await Promise.all([
+        setMetafield(customerId, 'balance', balance, 'integer'),
+        setMetafield(customerId, 'history', history, 'json')
+      ]);
+
+      console.log(`[refund-created] Done. New balance: ${balance}`);
+      res.status(200).send('ok');
     });
-
-    await Promise.all([
-      setMetafield(customerId, 'balance', balance, 'integer'),
-      setMetafield(customerId, 'history', history, 'json')
-    ]);
-
-    console.log(`[refund-created] Done. New balance: ${balance}`);
-    res.status(200).send('ok');
   } catch (e) {
     console.error('[refund-created]', e.message);
     res.status(500).send('error');
@@ -1199,27 +1227,29 @@ app.post('/api/admin/add-points', requireAdminAuth, async (req, res) => {
   }
 
   try {
-    const balanceMF = await getMetafield(customer_id, 'balance');
-    const current   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history     = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+    await withCustomerLock(customer_id, async () => {
+      const balanceMF = await getMetafield(customer_id, 'balance');
+      const current   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      const historyMF = await getMetafield(customer_id, 'history');
+      let history     = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    const newBalance = current + ptsInt;
+      const newBalance = current + ptsInt;
 
-    history.unshift({
-      type: 'earn', id: generateEntryId(), description: note || `${ptsInt} pts added manually`, points: ptsInt,
-      remaining_points: ptsInt, created_at: new Date().toISOString(),
-      expires_at: expiryDate.toISOString(), is_manual: true
+      history.unshift({
+        type: 'earn', id: generateEntryId(), description: note || `${ptsInt} pts added manually`, points: ptsInt,
+        remaining_points: ptsInt, created_at: new Date().toISOString(),
+        expires_at: expiryDate.toISOString(), is_manual: true
+      });
+
+      await Promise.all([
+        setMetafield(customer_id, 'balance', newBalance, 'integer'),
+        setMetafield(customer_id, 'history', history, 'json')
+      ]);
+
+      console.log(`[admin/add-points] Customer ${customer_id}: +${ptsInt}pts → balance ${current} → ${newBalance}, expires ${expires_at}`);
+      res.json({ ok: true, previous_balance: current, new_balance: newBalance, expires_at: expiryDate.toISOString() });
     });
-
-    await Promise.all([
-      setMetafield(customer_id, 'balance', newBalance, 'integer'),
-      setMetafield(customer_id, 'history', history, 'json')
-    ]);
-
-    console.log(`[admin/add-points] Customer ${customer_id}: +${ptsInt}pts → balance ${current} → ${newBalance}, expires ${expires_at}`);
-    res.json({ ok: true, previous_balance: current, new_balance: newBalance, expires_at: expiryDate.toISOString() });
   } catch (e) {
     console.error('[admin/add-points]', e.message);
     res.status(500).json({ error: e.message });
@@ -1245,27 +1275,29 @@ app.post('/api/admin/deduct-points', requireAdminAuth, async (req, res) => {
   }
 
   try {
-    const balanceMF = await getMetafield(customer_id, 'balance');
-    const current   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
-    const historyMF = await getMetafield(customer_id, 'history');
-    let history     = [];
-    if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+    await withCustomerLock(customer_id, async () => {
+      const balanceMF = await getMetafield(customer_id, 'balance');
+      const current   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+      const historyMF = await getMetafield(customer_id, 'history');
+      let history     = [];
+      if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
-    const newBalance = Math.max(0, current - ptsInt);
-    const consumedFrom = consumeFIFO(history, ptsInt);
+      const newBalance = Math.max(0, current - ptsInt);
+      const consumedFrom = consumeFIFO(history, ptsInt);
 
-    history.unshift({
-      type: 'use', id: generateEntryId(), description: note || `${ptsInt} pts deducted manually`,
-      points: ptsInt, created_at: new Date().toISOString(), is_manual: true, consumed_from: consumedFrom
+      history.unshift({
+        type: 'use', id: generateEntryId(), description: note || `${ptsInt} pts deducted manually`,
+        points: ptsInt, created_at: new Date().toISOString(), is_manual: true, consumed_from: consumedFrom
+      });
+
+      await Promise.all([
+        setMetafield(customer_id, 'balance', newBalance, 'integer'),
+        setMetafield(customer_id, 'history', history, 'json')
+      ]);
+
+      console.log(`[admin/deduct-points] Customer ${customer_id}: -${ptsInt}pts → balance ${current} → ${newBalance}`);
+      res.json({ ok: true, previous_balance: current, new_balance: newBalance });
     });
-
-    await Promise.all([
-      setMetafield(customer_id, 'balance', newBalance, 'integer'),
-      setMetafield(customer_id, 'history', history, 'json')
-    ]);
-
-    console.log(`[admin/deduct-points] Customer ${customer_id}: -${ptsInt}pts → balance ${current} → ${newBalance}`);
-    res.json({ ok: true, previous_balance: current, new_balance: newBalance });
   } catch (e) {
     console.error('[admin/deduct-points]', e.message);
     res.status(500).json({ error: e.message });
