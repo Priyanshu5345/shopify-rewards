@@ -19,16 +19,29 @@
  *   Backfill once via /api/admin/backfill-birthday-index, then the monthly
  *   cron reads only the index — never the full customer list.
  *
- * Stale applied-points recovery: a customer can apply points on the cart
- *   page, which immediately deducts balance and creates a one-time Shopify
- *   discount code — BEFORE any order exists. If they abandon checkout before
- *   paying, no order-cancelled or refund-created webhook ever fires (no order
- *   was created), so nothing would otherwise restore those points. GET
- *   /api/points — already called on every cart-page load — now also checks
- *   for applied codes older than STALE_APPLY_MS that were never actually used
- *   in a completed order, restores the points, and deletes the unused
- *   Shopify price rule/discount code. This uses the exact same
- *   delete-then-credit sequence as the customer-initiated /api/restore route.
+ * Stale applied-points recovery — TWO LAYERS:
+ *   1. PROACTIVE: an in-memory registry (pendingApplies) tracks every code
+ *      created by /api/apply or /api/update-apply. A setInterval sweep
+ *      checks it every SWEEP_INTERVAL_MS and resolves anything past
+ *      STALE_APPLY_MS — restoring points if the code was never used, leaving
+ *      it alone if it was. This registry lives in memory only: a server
+ *      restart clears it.
+ *   2. FALLBACK (always active, regardless of #1): GET /api/points — called
+ *      on every cart-page load — runs the same stale-check against the
+ *      customer's actual history. So even if the in-memory registry is lost
+ *      to a restart, nothing is silently stuck forever; it's caught on that
+ *      customer's next cart visit at the latest.
+ *
+ *   CORRECTNESS-CRITICAL: order-paid marks the matching 'use' history entry
+ *   with confirmed:true at the exact moment it deletes that code. Both
+ *   layers above skip any entry with confirmed:true BEFORE ever asking
+ *   Shopify anything. This exists because once a code is deleted for having
+ *   been legitimately used, a later Shopify lookup for it returns "not
+ *   found" — indistinguishable, by API response alone, from "never existed
+ *   because it was abandoned." Without the confirmed flag as ground truth,
+ *   a slow-but-genuine checkout (order completes >30 min after points were
+ *   applied) would have its points wrongly restored on top of the purchase
+ *   already having spent them.
  *
  * Rate limiting: every outbound Shopify call is serialized through a single
  *   throttled queue (~1.8 req/sec) with automatic 429 retry.
@@ -55,11 +68,11 @@ const BONUS_COUPON         = 'FREE50';
 const POINTS_EXPIRY_MONTHS = 6;
 
 // How long an applied-but-unused RWRD- code is given before it's treated as
-// abandoned. Used both for /api/apply's "reuse an existing code" check and
-// for the auto-restore sweep in GET /api/points — one constant, so the two
-// can't silently drift apart. Front-end localStorage windows in
-// rewards-panel.js should be kept in sync with this value.
-const STALE_APPLY_MS = 30 * 60 * 1000; // 30 minutes
+// abandoned. Used by /api/apply's reuse check, the fallback sweep in
+// GET /api/points, and the proactive periodic sweep below — one constant,
+// so all three can't drift apart. Keep rewards-panel.js's STALE_MS in sync.
+const STALE_APPLY_MS   = 30 * 60 * 1000; // 30 minutes
+const SWEEP_INTERVAL_MS = 2 * 60 * 1000; // how often the proactive sweep runs
 
 const HEADERS = {
   'X-Shopify-Access-Token': TOKEN,
@@ -173,7 +186,7 @@ async function setShopMetafield(key, value) {
 }
 
 /* ─────────────────────────────────────────
-   IN-PROCESS INDEX LOCK
+   IN-PROCESS INDEX LOCK (birthday_index)
    Serializes concurrent birthday_index read-modify-writes on this single
    process. Does not protect against multiple horizontally-scaled instances.
    ───────────────────────────────────────── */
@@ -196,17 +209,64 @@ function parseWebhookBody(req) {
   return JSON.parse(req.body.toString('utf8'));
 }
 
+/* ─────────────────────────────────────────
+   SHARED CODE LOOKUP + CLEANUP
+   One Shopify lookup, used by every path that needs to know "was this
+   RWRD- code ever used, and is it gone yet." usage_limit on every RWRD-
+   price rule is always 1, so once a code is found at all, it can never be
+   used again regardless of its current usage_count — safe to delete
+   unconditionally whenever this function finds it, whether it was spent
+   (usage_count 1) or abandoned (usage_count 0). Only the CALLER decides
+   whether usage_count 0 means "restore points."
+   ───────────────────────────────────────── */
+async function lookupAndCleanupCode(discountCode) {
+  const lookup = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(discountCode)}`);
+  const priceRuleId = lookup.discount_code?.price_rule_id;
+  if (!priceRuleId) return { usageCount: 0, existed: false };
+
+  const codeData = await shopifyFetch(`/price_rules/${priceRuleId}/discount_codes.json`);
+  const codeObj  = (codeData.discount_codes || []).find(c => c.code === discountCode);
+  const usageCount = codeObj?.usage_count ?? 0;
+
+  await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
+  console.log(`[cleanup] Deleted price rule ${priceRuleId} (${discountCode}), usage_count=${usageCount}`);
+
+  return { usageCount, existed: true };
+}
+
+// Kept as a thin wrapper for the two call sites (order-paid, order-cancelled)
+// that just want "delete this and don't care about usage_count."
 async function deleteRwrdCode(code) {
   try {
-    const data = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(code)}`);
-    const priceRuleId = data.discount_code?.price_rule_id;
-    if (priceRuleId) {
-      await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
-      console.log(`[cleanup] Deleted price rule ${priceRuleId} for ${code}`);
-    }
+    await lookupAndCleanupCode(code);
   } catch (e) {
     console.error(`[cleanup] Could not delete ${code}:`, e.message);
   }
+}
+
+/* ─────────────────────────────────────────
+   PROACTIVE SWEEP REGISTRY
+   customerId (string) -> Map<discountCode, appliedAtMs>
+   Populated by /api/apply and /api/update-apply. Entries are removed as
+   soon as they're resolved (restored, confirmed-used, or manually
+   restored via /api/restore) so the periodic sweep never re-checks a
+   code twice. In-memory only — see file header comment for what that
+   does and does not mean for reliability.
+   ───────────────────────────────────────── */
+const pendingApplies = new Map();
+
+function registerPendingApply(customerId, discountCode) {
+  const key = String(customerId);
+  if (!pendingApplies.has(key)) pendingApplies.set(key, new Map());
+  pendingApplies.get(key).set(discountCode, Date.now());
+}
+
+function unregisterPendingApply(customerId, discountCode) {
+  const key = String(customerId);
+  const codes = pendingApplies.get(key);
+  if (!codes) return;
+  codes.delete(discountCode);
+  if (codes.size === 0) pendingApplies.delete(key);
 }
 
 /* ─────────────────────────────────────────
@@ -258,19 +318,11 @@ async function processExpiry(customerId, balance, history) {
 }
 
 /* ─────────────────────────────────────────
-   STALE APPLIED-POINTS RECOVERY
-   Finds 'use' entries with an RWRD- discount code, not yet refunded, older
-   than STALE_APPLY_MS. For each, checks Shopify directly whether the code
-   was ever actually used in a completed order:
-     - usage_count === 0 → genuinely abandoned. Delete the unused price rule
-       (same call /api/restore already makes), remove the history entry
-       entirely (matches /api/restore's semantics — nothing ever happened),
-       and credit the points back to balance.
-     - usage_count > 0   → an order WAS placed with this code. Leave it
-       alone; order-paid already accounts for it correctly elsewhere.
-   A lookup failure (code already gone, network hiccup) is treated as
-   "nothing to restore" rather than surfaced as an error — consistent with
-   how /api/check-code already fails safe on the same kind of lookup.
+   STALE APPLIED-POINTS RECOVERY — FALLBACK LAYER
+   Runs inside GET /api/points, unconditionally, regardless of whether the
+   proactive sweep already handled (or ever knew about) a given code.
+   Skips any entry with confirmed:true — see file header for why that flag
+   is load-bearing here.
    ───────────────────────────────────────── */
 async function restoreStaleAppliedCodes(customerId, balance, history) {
   const now = Date.now();
@@ -279,34 +331,21 @@ async function restoreStaleAppliedCodes(customerId, balance, history) {
   const staleEntries = history.filter(h =>
     h.type === 'use' &&
     !h.refunded &&
+    !h.confirmed &&
     h.discount_code?.startsWith('RWRD-') &&
     (now - new Date(h.created_at).getTime()) > STALE_APPLY_MS
   );
 
   for (const entry of staleEntries) {
     try {
-      const lookup = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(entry.discount_code)}`);
-      const priceRuleId = lookup.discount_code?.price_rule_id;
-
-      let usageCount = 0;
-      if (priceRuleId) {
-        const codeData = await shopifyFetch(`/price_rules/${priceRuleId}/discount_codes.json`);
-        const codeObj  = (codeData.discount_codes || []).find(c => c.code === entry.discount_code);
-        usageCount = codeObj?.usage_count ?? 0;
-      }
-
+      const { usageCount } = await lookupAndCleanupCode(entry.discount_code);
       if (usageCount === 0) {
-        if (priceRuleId) {
-          await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
-          console.log(`[auto-restore] Deleted unused price rule ${priceRuleId} (${entry.discount_code})`);
-        }
         balance += entry.points;
         history  = history.filter(h => h !== entry);
         changed  = true;
         console.log(`[auto-restore] Customer ${customerId}: restored ${entry.points}pts from abandoned checkout (${entry.discount_code})`);
       }
-      // usageCount > 0 means an order actually completed with this code —
-      // nothing stale about it, leave it exactly as-is.
+      unregisterPendingApply(customerId, entry.discount_code);
     } catch (e) {
       console.log(`[auto-restore] Could not verify ${entry.discount_code}, skipping: ${e.message}`);
     }
@@ -316,10 +355,64 @@ async function restoreStaleAppliedCodes(customerId, balance, history) {
 }
 
 /* ─────────────────────────────────────────
+   PROACTIVE SWEEP — runs every SWEEP_INTERVAL_MS
+   Checks the in-memory registry rather than every customer's full history,
+   so this stays cheap regardless of store size. Skips entries whose
+   history entry is confirmed:true, same as the fallback layer.
+   ───────────────────────────────────────── */
+async function sweepPendingApplies() {
+  const now = Date.now();
+
+  for (const [customerId, codes] of pendingApplies) {
+    for (const [discountCode, appliedAt] of codes) {
+      if (now - appliedAt < STALE_APPLY_MS) continue;
+
+      try {
+        const historyMF = await getMetafield(customerId, 'history');
+        let history = [];
+        if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+        const entry = history.find(h => h.type === 'use' && h.discount_code === discountCode && !h.refunded);
+
+        if (!entry || entry.confirmed) {
+          // Already resolved some other way (manual restore, order-paid
+          // confirmation) — just stop tracking it.
+          unregisterPendingApply(customerId, discountCode);
+          continue;
+        }
+
+        const { usageCount } = await lookupAndCleanupCode(discountCode);
+
+        if (usageCount === 0) {
+          const balanceMF = await getMetafield(customerId, 'balance');
+          const balance   = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+          const newBalance = balance + entry.points;
+          const newHistory = history.filter(h => h !== entry);
+
+          await Promise.all([
+            setMetafield(customerId, 'balance', newBalance, 'integer'),
+            setMetafield(customerId, 'history', newHistory, 'json')
+          ]);
+
+          console.log(`[auto-restore-sweep] Customer ${customerId}: restored ${entry.points}pts (${discountCode}). Balance ${balance} → ${newBalance}`);
+        }
+
+        unregisterPendingApply(customerId, discountCode);
+      } catch (e) {
+        console.error(`[auto-restore-sweep] Error resolving ${discountCode} for customer ${customerId}:`, e.message);
+        // Leave it registered — retry on the next tick rather than losing
+        // track of it after a single transient failure.
+      }
+    }
+  }
+}
+
+setInterval(() => {
+  sweepPendingApplies().catch(e => console.error('[auto-restore-sweep] Unhandled error:', e.message));
+}, SWEEP_INTERVAL_MS);
+
+/* ─────────────────────────────────────────
    ROUTE: GET /api/points
-   Runs expiry, THEN the stale-applied-points sweep, writing back once
-   if either made a change. Both are lazy checks — no cron needed — since
-   this route is already called on every cart-page load.
    ───────────────────────────────────────── */
 app.get('/api/points', async (req, res) => {
   const { customer_id } = req.query;
@@ -382,6 +475,7 @@ app.get('/api/check-code', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/apply
+   Registers the new code with the proactive sweep on success.
    ───────────────────────────────────────── */
 app.post('/api/apply', async (req, res) => {
   const { customer_id, points_to_use, cart_total } = req.body;
@@ -413,6 +507,7 @@ app.post('/api/apply', async (req, res) => {
     );
     if (existing) {
       console.log(`[apply] Reusing code ${existing.discount_code}`);
+      registerPendingApply(customer_id, existing.discount_code);
       return res.json({ discount_code: existing.discount_code, discount_amount: ptsInt });
     }
 
@@ -443,6 +538,7 @@ app.post('/api/apply', async (req, res) => {
       setMetafield(customer_id, 'history', history, 'json')
     ]);
 
+    registerPendingApply(customer_id, code);
     console.log(`[apply] Customer ${customer_id}: ${ptsInt}pts → code ${code}`);
     res.json({ discount_code: code, discount_amount: ptsInt });
   } catch (e) {
@@ -453,6 +549,8 @@ app.post('/api/apply', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/update-apply
+   Deregisters the old code (already resolved inline below), registers
+   the new one with the proactive sweep.
    ───────────────────────────────────────── */
 app.post('/api/update-apply', async (req, res) => {
   const { customer_id, old_points, old_discount_code, new_points, cart_total } = req.body;
@@ -474,13 +572,8 @@ app.post('/api/update-apply', async (req, res) => {
   try {
     let oldCodeWasUsed = false;
     try {
-      const searchData  = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(old_discount_code)}`);
-      const priceRuleId = searchData.discount_code?.price_rule_id;
-      if (priceRuleId) {
-        const codeData = await shopifyFetch(`/price_rules/${priceRuleId}/discount_codes.json`);
-        const codeObj  = (codeData.discount_codes || []).find(c => c.code === old_discount_code);
-        oldCodeWasUsed = codeObj ? codeObj.usage_count > 0 : false;
-      }
+      const { usageCount } = await lookupAndCleanupCode(old_discount_code);
+      oldCodeWasUsed = usageCount > 0;
     } catch (e) {
       console.log(`[update-apply] Old code lookup failed: ${e.message}`);
     }
@@ -492,13 +585,13 @@ app.post('/api/update-apply', async (req, res) => {
     if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
 
     if (!oldCodeWasUsed) {
-      try { await deleteRwrdCode(old_discount_code); } catch {}
       balance = balance + oldPts;
       history = history.filter(h => !(h.type === 'use' && h.discount_code === old_discount_code));
       console.log(`[update-apply] Old code unused — restored ${oldPts}pts`);
     } else {
       console.log(`[update-apply] Old code was used — cannot restore ${oldPts}pts`);
     }
+    unregisterPendingApply(customer_id, old_discount_code);
 
     balance = balance - newPts;
     if (balance < 0) return res.status(400).json({ error: 'Insufficient points' });
@@ -530,6 +623,7 @@ app.post('/api/update-apply', async (req, res) => {
       setMetafield(customer_id, 'history', history, 'json')
     ]);
 
+    registerPendingApply(customer_id, code);
     console.log(`[update-apply] ${oldPts}→${newPts}pts. Balance=${balance}`);
     res.json({ discount_code: code, discount_amount: newPts });
   } catch (e) {
@@ -540,8 +634,8 @@ app.post('/api/update-apply', async (req, res) => {
 
 /* ─────────────────────────────────────────
    ROUTE: POST /api/restore
-   Customer-initiated instant restore — identical delete-then-credit
-   sequence to the automatic sweep above.
+   Customer-initiated instant restore. Deregisters from the proactive
+   sweep since it's already resolved.
    ───────────────────────────────────────── */
 app.post('/api/restore', async (req, res) => {
   const { customer_id, points, discount_code } = req.body;
@@ -553,17 +647,8 @@ app.post('/api/restore', async (req, res) => {
     let codeWasUsed = false;
     if (discount_code) {
       try {
-        const searchData  = await shopifyFetch(`/discount_codes/lookup.json?code=${encodeURIComponent(discount_code)}`);
-        const priceRuleId = searchData.discount_code?.price_rule_id;
-        if (priceRuleId) {
-          const codeData = await shopifyFetch(`/price_rules/${priceRuleId}/discount_codes.json`);
-          const codeObj  = (codeData.discount_codes || []).find(c => c.code === discount_code);
-          codeWasUsed    = codeObj ? codeObj.usage_count > 0 : false;
-          if (!codeWasUsed) {
-            await shopifyFetch(`/price_rules/${priceRuleId}.json`, { method: 'DELETE' });
-            console.log(`[restore] Deleted unused price rule ${priceRuleId}`);
-          }
-        }
+        const { usageCount } = await lookupAndCleanupCode(discount_code);
+        codeWasUsed = usageCount > 0;
       } catch (e) {
         console.log(`[restore] Code lookup failed: ${e.message}`);
       }
@@ -586,6 +671,7 @@ app.post('/api/restore', async (req, res) => {
       console.log(`[restore] Code was used — points not restored`);
     }
 
+    if (discount_code) unregisterPendingApply(customer_id, discount_code);
     res.json({ ok: true, restored: !codeWasUsed });
   } catch (e) {
     console.error('[restore]', e.message);
@@ -639,6 +725,8 @@ app.post('/api/webhook/customer-created', express.raw({ type: 'application/json'
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-paid
+   Marks the matching 'use' entry confirmed:true at the exact moment its
+   code is deleted — see file header for why this is load-bearing.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
@@ -681,6 +769,20 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
       order_id: String(orderId)
     });
 
+    // Mark any RWRD- redemption used in THIS order as confirmed, in the
+    // same read-modify-write as the earn entry above — before the code
+    // gets deleted a few lines down, so there's no window where the code
+    // is gone but the entry doesn't yet say why.
+    const rwrdCodes = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
+    for (const d of rwrdCodes) {
+      const useEntry = history.find(h => h.type === 'use' && h.discount_code === d.code && !h.refunded);
+      if (useEntry) {
+        useEntry.confirmed = true;
+        useEntry.redeemed_in_order = String(orderId);
+      }
+      unregisterPendingApply(customerId, d.code);
+    }
+
     await Promise.all([
       setMetafield(customerId, 'balance', newBalance, 'integer'),
       setMetafield(customerId, 'history', history, 'json')
@@ -688,7 +790,6 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
     console.log(`[order-paid] Balance: ${balance} + ${earnedPoints} = ${newBalance}`);
 
-    const rwrdCodes = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
     for (const d of rwrdCodes) await deleteRwrdCode(d.code);
 
     res.status(200).send('ok');
@@ -700,6 +801,10 @@ app.post('/api/webhook/order-paid', express.raw({ type: 'application/json' }), a
 
 /* ─────────────────────────────────────────
    WEBHOOK: POST /api/webhook/order-cancelled
+   Note: confirmed:true entries ARE still eligible to be touched here —
+   that flag only gates the stale-abandonment sweeps above. A genuine
+   cancellation of a completed order is exactly what this webhook exists
+   to handle, confirmed or not.
    ───────────────────────────────────────── */
 app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!verifyHmac(req)) return res.status(401).send('Unauthorized');
@@ -772,7 +877,10 @@ app.post('/api/webhook/order-cancelled', express.raw({ type: 'application/json' 
     console.log(`[order-cancelled] Done. New balance: ${balance}`);
 
     const codesToDelete = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
-    for (const d of codesToDelete) await deleteRwrdCode(d.code);
+    for (const d of codesToDelete) {
+      await deleteRwrdCode(d.code);
+      unregisterPendingApply(customerId, d.code);
+    }
 
     res.status(200).send('ok');
   } catch (e) {
