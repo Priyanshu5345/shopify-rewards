@@ -60,7 +60,7 @@
  *
  * Manual point admin: no admin panel exists. Credits/debits are sent by hand
  *   via ReqBin as raw POST requests. There is deliberately no "set balance to
- *   X" action — only additive add-points / deduct-points.
+ *   X" action — only additive add-points / deduct-points. 
  */
 
 const express = require('express');
