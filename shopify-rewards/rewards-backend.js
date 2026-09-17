@@ -324,16 +324,6 @@ async function deleteRwrdCode(code) {
 }
 
 /* ─────────────────────────────────────────
-   PER-ORDER PROCESSING LOCK
-   Shopify can and does redeliver webhooks (slow response, retry after
-   failure, or genuine duplicate delivery). This serializes order-paid
-   processing per order_id so two near-simultaneous deliveries for the
-   SAME order can't both read history before either has written — closing
-   the race version of the duplicate-credit bug, not just the sequential
-   version (which the order_id idempotency check below already covers on
-   its own for deliveries spaced apart in time).
-   ───────────────────────────────────────── */
-/* ─────────────────────────────────────────
    PER-CUSTOMER PROCESSING LOCK
    Every route that reads-then-writes a customer's balance/history
    metafields must be serialized against every OTHER route touching that
@@ -1346,6 +1336,167 @@ app.post('/api/save-birthday', async (req, res) => {
 /* ─────────────────────────────────────────
    ROUTE: POST /api/admin/backfill-birthday-index
    ───────────────────────────────────────── */
+/* ─────────────────────────────────────────
+   ROUTE: POST /api/admin/reconcile-orders
+   One-time (but safe to re-run) recovery tool for when this server was
+   down longer than Shopify's ~4-hour webhook retry window — meaning some
+   paid orders' order-paid webhook was permanently dropped and will NEVER
+   arrive on its own. Pulls paid orders from Shopify in [from, to] and, for
+   any whose customer doesn't already have a matching order_id earn entry,
+   credits them using the exact same logic order-paid itself uses (same
+   bonus check, same amount calc, same RWRD- confirm-and-delete).
+
+   Idempotent by design: orders already credited — including ones whose
+   webhook eventually DID retry successfully before you noticed the
+   outage — are detected and skipped automatically. Safe to re-run over
+   the same window, or a wider one, without double-crediting anything.
+
+   dry_run defaults to true: reports exactly what WOULD be credited
+   (order numbers, customer ids, point amounts) without writing anything.
+   Review that output, then re-run with dry_run:false to commit.
+
+   Body: { secret, from, to, dry_run }
+   from/to: ISO 8601 datetimes. Filtered on processed_at (when the order
+   was actually paid), not created_at, since that's what determines when
+   order-paid would have fired. Pad the window a bit on both sides —
+   rechecking an extra hour that was already fine costs nothing (it just
+   reports "already credited"), but missing the true edge of the outage
+   costs a silently-uncredited customer.
+
+   Requires the Shopify access token to have order read access covering
+   this date range — if the outage was more than 60 days ago, check the
+   token's scope before assuming this will just work.
+   ───────────────────────────────────────── */
+let reconcileRunning = false;
+
+app.post('/api/admin/reconcile-orders', requireAdminAuth, async (req, res) => {
+  const { from, to } = req.body;
+  const dryRun = req.body.dry_run !== false; // must explicitly pass false to commit
+
+  if (!from || !to) {
+    return res.status(400).json({ error: 'Required: from, to (ISO 8601 datetimes)' });
+  }
+  if (isNaN(new Date(from).getTime()) || isNaN(new Date(to).getTime())) {
+    return res.status(400).json({ error: 'from/to must be valid ISO 8601 datetimes' });
+  }
+  if (reconcileRunning) {
+    return res.status(409).json({ error: 'Reconciliation already in progress. Check Railway logs for completion.' });
+  }
+  reconcileRunning = true;
+
+  res.json({ ok: true, status: 'reconcile_started', dry_run: dryRun, from, to });
+
+  try {
+    let scanned = 0, alreadyCredited = 0, credited = 0, skippedNoCustomer = 0, skippedNotPaid = 0, errors = 0;
+    const details = [];
+
+    let page = `https://${SHOP}/admin/api/2025-04/orders.json?status=any&financial_status=paid` +
+               `&processed_at_min=${encodeURIComponent(from)}&processed_at_max=${encodeURIComponent(to)}` +
+               `&limit=250&fields=id,order_number,total_price,discount_codes,customer,financial_status,cancelled_at`;
+
+    while (page) {
+      let res2;
+      try {
+        res2 = await throttledFetch(page, { headers: HEADERS });
+      } catch (e) {
+        console.error('[reconcile] Order page fetch failed:', e.message);
+        break;
+      }
+      if (!res2.ok) {
+        console.error('[reconcile] Failed to fetch orders:', res2.status);
+        break;
+      }
+
+      const data   = await res2.json();
+      const orders = data.orders || [];
+
+      for (const order of orders) {
+        scanned++;
+        try {
+          if (order.cancelled_at || order.financial_status !== 'paid') { skippedNotPaid++; continue; }
+
+          const customerId = order.customer?.id;
+          if (!customerId) { skippedNoCustomer++; continue; }
+
+          await withCustomerLock(customerId, async () => {
+            const historyMF = await getMetafield(customerId, 'history');
+            let history = [];
+            if (historyMF) { try { history = JSON.parse(historyMF.value); } catch {} }
+
+            const alreadyHasEntry = history.some(
+              h => h.type === 'earn' && h.order_id === String(order.id) && !h.reversed
+            );
+            if (alreadyHasEntry) { alreadyCredited++; return; }
+
+            const usedCoupons     = (order.discount_codes || []).map(d => (d.code || '').toUpperCase());
+            const usedBonusCoupon = usedCoupons.includes(BONUS_COUPON.toUpperCase());
+            const amountPaid      = Math.round(parseFloat(order.total_price) * 100);
+            const earnedPoints    = usedBonusCoupon
+              ? Math.floor(amountPaid / 100)
+              : Math.floor(amountPaid / 10000);
+
+            if (dryRun) {
+              credited++;
+              details.push({ order_number: order.order_number, customer_id: customerId, points: earnedPoints });
+              return;
+            }
+
+            const balanceMF  = await getMetafield(customerId, 'balance');
+            const balance    = balanceMF ? parseInt(balanceMF.value, 10) : 0;
+            const newBalance = balance + earnedPoints;
+
+            const expiresAt = new Date();
+            expiresAt.setMonth(expiresAt.getMonth() + POINTS_EXPIRY_MONTHS);
+
+            history.unshift({
+              type: 'earn', id: generateEntryId(),
+              description: `Order #${order.order_number} — ${earnedPoints} pts earned${usedBonusCoupon ? ' (100% bonus)' : ''} (reconciled after downtime)`,
+              points: earnedPoints, remaining_points: earnedPoints,
+              created_at: new Date().toISOString(), expires_at: expiresAt.toISOString(),
+              order_id: String(order.id)
+            });
+
+            const rwrdCodes = (order.discount_codes || []).filter(d => d.code?.startsWith('RWRD-'));
+            for (const d of rwrdCodes) {
+              const useEntry = history.find(h => h.type === 'use' && h.discount_code === d.code && !h.refunded);
+              if (useEntry) {
+                useEntry.confirmed = true;
+                useEntry.redeemed_in_order = String(order.id);
+              }
+              unregisterPendingApply(customerId, d.code);
+            }
+
+            await Promise.all([
+              setMetafield(customerId, 'balance', newBalance, 'integer'),
+              setMetafield(customerId, 'history', history, 'json')
+            ]);
+
+            for (const d of rwrdCodes) await deleteRwrdCode(d.code);
+
+            credited++;
+            details.push({ order_number: order.order_number, customer_id: customerId, points: earnedPoints, new_balance: newBalance });
+            console.log(`[reconcile] Order #${order.order_number} (customer ${customerId}): credited ${earnedPoints}pts. Balance ${balance} → ${newBalance}`);
+          });
+        } catch (e) {
+          errors++;
+          console.error(`[reconcile] Error processing order ${order.id}:`, e.message);
+        }
+      }
+
+      const linkHeader = res2.headers.get('link');
+      const nextMatch  = linkHeader?.match(/<([^>]+)>;\s*rel="next"/);
+      page = nextMatch ? nextMatch[1] : null;
+    }
+
+    console.log(`[reconcile] Finished. dry_run=${dryRun}. Scanned ${scanned}, already credited ${alreadyCredited}, credited ${credited}, skipped (no customer) ${skippedNoCustomer}, skipped (not paid/cancelled) ${skippedNotPaid}, errors ${errors}.`);
+    console.log(`[reconcile] Detail: ${JSON.stringify(details, null, 2)}`);
+  } catch (e) {
+    console.error('[reconcile] Failed:', e.message);
+  } finally {
+    reconcileRunning = false;
+  }
+});
+
 let backfillRunning = false;
 
 app.post('/api/admin/backfill-birthday-index', requireAdminAuth, async (req, res) => {
